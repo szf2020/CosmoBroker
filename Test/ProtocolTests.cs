@@ -123,4 +123,19 @@ public class ProtocolTests : TestBase
         // Our parser currently just swallows or ignores if it doesn't match.
         // Official NATS returns -ERR.
     }
+
+    [Fact]
+    public async Task TestMaxPayloadExceeded()
+    {
+        await Server.StartAsync(Cts.Token);
+        using var client = await CreateClientAsync();
+
+        int size = 1048577; // 1MB + 1
+        string payload = new string('a', size);
+        await client.SendAsync($"PUB foo {size}\r\n{payload}\r\n");
+
+        var resp = await client.ReadResponseAsync();
+        Assert.Contains("-ERR", resp);
+        Assert.Contains("Maximum Payload Exceeded", resp);
+    }
 }

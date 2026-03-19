@@ -14,6 +14,7 @@ namespace CosmoBroker;
 
 public class BrokerConnection
 {
+    private const int MaxPayloadBytes = 1048576;
     private readonly Stream _stream;
     private readonly bool _sendInfoOnConnect;
     private readonly string _remoteEndPoint;
@@ -239,6 +240,17 @@ public class BrokerConnection
                                     var payloadStart = buffer.GetPosition(1, linePosition.Value);
                                     var remaining = buffer.Slice(payloadStart);
                                     
+                                    if (totalLength > MaxPayloadBytes)
+                                    {
+                                        SendError("Maximum Payload Exceeded");
+                                        if (remaining.Length >= totalLength + 2)
+                                        {
+                                            buffer = remaining.Slice(totalLength + 2);
+                                            continue;
+                                        }
+                                        else break;
+                                    }
+
                                     if (remaining.Length >= totalLength + 2)
                                     {
                                         var fullPayload = remaining.Slice(0, totalLength);
