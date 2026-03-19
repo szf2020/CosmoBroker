@@ -97,6 +97,16 @@ namespace CosmoBroker.Services
             if (sequence > 0) msg.Sequence = sequence;
 
             await BroadcastToConsumers(stream, msg);
+
+            // Mirror and Source propagation (best-effort, in-memory)
+            foreach (var target in _streams.Values)
+            {
+                if (target.Config.Mirror?.Name == streamName ||
+                    target.Config.Sources.Any(s => s.Name == streamName))
+                {
+                    _ = Publish(target.Name, subject, payload, ttl, msgId);
+                }
+            }
         }
 
         private async Task BroadcastToConsumers(JetStreamEntity stream, StreamMessage msg)
@@ -378,6 +388,7 @@ namespace CosmoBroker.Services
             {
                 while (true)
                 {
+                    ApplyFlowControl();
                     foreach (var stream in _streams.Values)
                     {
                         foreach (var consumer in stream.Consumers)
@@ -403,6 +414,26 @@ namespace CosmoBroker.Services
                     await Task.Delay(checkInterval);
                 }
             });
+        }
+
+        private void ApplyFlowControl()
+        {
+            // Basic flow control: if too many in-flight messages, avoid further delivery.
+            foreach (var stream in _streams.Values)
+            {
+                foreach (var consumer in stream.Consumers)
+                {
+                    if (consumer.Config.MaxDeliver == 0) continue;
+                    if (consumer.InFlight.Count > 1000)
+                    {
+                        // Best-effort: trim oldest in-flight entries by removing arbitrary ones.
+                        foreach (var key in consumer.InFlight.Keys.Take(100))
+                        {
+                            consumer.InFlight.TryRemove(key, out _);
+                        }
+                    }
+                }
+            }
         }
 
         public IEnumerable<string> GetMatchingStreams(string subject)

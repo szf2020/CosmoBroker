@@ -36,6 +36,24 @@ namespace CosmoBroker.JetStream.Models
 
         [System.Text.Json.Serialization.JsonPropertyName("duplicate_window")]
         public TimeSpan DuplicateWindow { get; set; } = TimeSpan.FromMinutes(2);
+
+        [System.Text.Json.Serialization.JsonPropertyName("mirror")]
+        public MirrorConfig? Mirror { get; set; }
+
+        [System.Text.Json.Serialization.JsonPropertyName("sources")]
+        public List<SourceConfig> Sources { get; set; } = new();
+    }
+
+    public class MirrorConfig
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("name")]
+        public string Name { get; set; } = string.Empty;
+    }
+
+    public class SourceConfig
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("name")]
+        public string Name { get; set; } = string.Empty;
     }
 
     public class JetStreamEntity
