@@ -93,21 +93,37 @@ public class TestClient : IDisposable
         byte[] buffer = new byte[16384];
         var delay = 20;
         int totalDelayed = 0;
-        
+
         while (!_client.GetStream().DataAvailable && totalDelayed < timeoutMs)
         {
             await Task.Delay(delay);
             totalDelayed += delay;
         }
 
-        if (!_client.GetStream().DataAvailable) 
+        if (!_client.GetStream().DataAvailable)
         {
             _output.WriteLine("[Client Read] TIMEOUT - No data available");
             return string.Empty;
         }
-        
-        int read = await _stream.ReadAsync(buffer);
-        var result = Encoding.UTF8.GetString(buffer, 0, read);
+
+        using var ms = new MemoryStream();
+        int idleDelay = 0;
+        while (idleDelay < 100)
+        {
+            while (_client.GetStream().DataAvailable)
+            {
+                int read = await _stream.ReadAsync(buffer);
+                if (read <= 0) break;
+                ms.Write(buffer, 0, read);
+                idleDelay = 0;
+            }
+
+            if (_client.GetStream().DataAvailable) continue;
+            await Task.Delay(10);
+            idleDelay += 10;
+        }
+
+        var result = Encoding.UTF8.GetString(ms.ToArray());
         _output.WriteLine($"[Client Read] {result.Replace("\r", "\\r").Replace("\n", "\\n")}");
         return result;
     }
