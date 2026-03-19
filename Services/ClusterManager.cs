@@ -151,4 +151,7 @@ public class ClusterManager
             _ = conn.SendRawAsync(cmd);
         }
     }
+
+    public int RouteCount => _connections.Count;
+    public int GatewayCount => _gatewayConnections.Count;
 }

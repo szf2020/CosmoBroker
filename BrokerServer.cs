@@ -132,6 +132,9 @@ public class BrokerServer : IAsyncDisposable
 
     public object GetConnz() => new { connections = _connections.Keys.Select(c => c.GetStats()) };
     public object GetJsz() => _jetStream.GetStats();
+    public object GetRoutez() => new { routes = _cluster.RouteCount };
+    public object GetGatewayz() => new { gateways = _cluster.GatewayCount };
+    public object GetLeafz() => new { leafnodes = _leafnodes.ConnectionCount };
 
     private async Task AcceptLoopAsync(CancellationToken ct)
     {

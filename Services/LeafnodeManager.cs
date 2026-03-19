@@ -144,6 +144,8 @@ public class LeafnodeManager
             _ = conn.SendRawAsync($"UNSUB {sid}\r\n");
         }
     }
+
+    public int ConnectionCount => _connections.Count;
 }
 
 public sealed record LeafnodeHubConfig(Uri Hub, LeafnodeHubOptions Options);

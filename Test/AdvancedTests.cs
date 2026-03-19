@@ -49,5 +49,14 @@ public class AdvancedTests : TestBase
 
         var connz = await httpClient.GetStringAsync($"http://127.0.0.1:{MonitorPort}/connz");
         Assert.Contains("connections", connz);
+
+        var routez = await httpClient.GetStringAsync($"http://127.0.0.1:{MonitorPort}/routez");
+        Assert.Contains("routes", routez);
+
+        var leafz = await httpClient.GetStringAsync($"http://127.0.0.1:{MonitorPort}/leafz");
+        Assert.Contains("leafnodes", leafz);
+
+        var gatewayz = await httpClient.GetStringAsync($"http://127.0.0.1:{MonitorPort}/gatewayz");
+        Assert.Contains("gateways", gatewayz);
     }
 }

@@ -70,13 +70,25 @@ public class MonitoringService
             {
                 responseData = _server.GetConnz();
             }
+            else if (path == "/routez")
+            {
+                responseData = _server.GetRoutez();
+            }
+            else if (path == "/leafz")
+            {
+                responseData = _server.GetLeafz();
+            }
+            else if (path == "/gatewayz")
+            {
+                responseData = _server.GetGatewayz();
+            }
             else if (path == "/jsz")
             {
                 responseData = _server.GetJsz();
             }
             else
             {
-                responseData = new { error = "Not Found", paths = new[] { "/varz", "/connz", "/jsz" } };
+                responseData = new { error = "Not Found", paths = new[] { "/varz", "/connz", "/routez", "/leafz", "/gatewayz", "/jsz" } };
             }
 
             string json = JsonSerializer.Serialize(responseData, new JsonSerializerOptions { WriteIndented = true });
