@@ -80,4 +80,40 @@ public class TopologyTests : TestBase
         await a.DisposeAsync();
         await b.DisposeAsync();
     }
+
+    [Fact]
+    public async Task Gateway_ShouldForwardAcrossClusters()
+    {
+        int aPort = GetFreePort();
+        int aMon = GetFreePort();
+        var a = new BrokerServer(aPort, monitorPort: aMon);
+
+        int bPort = GetFreePort();
+        int bMon = GetFreePort();
+        var b = new BrokerServer(bPort, monitorPort: bMon);
+
+        a.AddGateway("127.0.0.1", bPort);
+        b.AddGateway("127.0.0.1", aPort);
+
+        await a.StartAsync();
+        await b.StartAsync();
+
+        using var clientB = await CreateClientAsync(bPort, output: Output);
+        await clientB.SendAsync("SUB bar 1\r\n");
+
+        for (int i = 0; i < 20; i++)
+        {
+            if (a.HasSubscribers("bar")) break;
+            await Task.Delay(50);
+        }
+
+        using var clientA = await CreateClientAsync(aPort, output: Output);
+        await clientA.SendAsync("PUB bar 5\r\nhello\r\n");
+
+        var resp = await clientB.ReadResponseAsync();
+        Assert.Contains("MSG bar 1 5\r\nhello", resp);
+
+        await a.DisposeAsync();
+        await b.DisposeAsync();
+    }
 }

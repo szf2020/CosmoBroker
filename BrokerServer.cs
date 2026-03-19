@@ -58,6 +58,16 @@ public class BrokerServer : IAsyncDisposable
         }
     }
 
+    public void AddGateway(string host, int port)
+    {
+        var ips = Dns.GetHostAddresses(host);
+        if (ips.Length > 0)
+        {
+            var ep = new IPEndPoint(ips[0], port);
+            _cluster.AddGateway(ep);
+        }
+    }
+
     public void AddLeafnodeHub(string uri, Services.LeafnodeHubOptions? options = null) => _leafnodes.AddHub(uri, options);
 
     public void EnterLameDuckMode()
