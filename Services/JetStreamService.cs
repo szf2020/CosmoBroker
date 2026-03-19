@@ -77,10 +77,13 @@ namespace CosmoBroker.Services
             }
         }
 
-        public async Task Publish(string streamName, string subject, byte[] payload, TimeSpan? ttl = null)
+        public async Task Publish(string streamName, string subject, byte[] payload, TimeSpan? ttl = null, string? msgId = null)
         {
             if (!_streams.TryGetValue(streamName, out var stream))
                 throw new Exception($"Stream {streamName} does not exist");
+
+            var now = DateTime.UtcNow;
+            if (stream.IsDuplicate(msgId, now)) return;
 
             long sequence = 0;
             if (_repo != null)
@@ -126,8 +129,15 @@ namespace CosmoBroker.Services
             _topicTree.PublishWithTTL(consumer.DeliverSubject ?? "", new System.Buffers.ReadOnlySequence<byte>(msg.Payload), ackReply, remainingTtl);
 
             consumer.LastDeliveredSeq = msg.Sequence;
-            consumer.InFlight[msg.Sequence] = msg;
-            consumer.DeliveryAttempts.AddOrUpdate(msg.Sequence, 1, (_, count) => count + 1);
+            if (consumer.Config.AckPolicy != AckPolicy.None)
+            {
+                consumer.InFlight[msg.Sequence] = msg;
+                consumer.DeliveryAttempts.AddOrUpdate(msg.Sequence, 1, (_, count) => count + 1);
+            }
+            else if (stream.Config.Retention == RetentionPolicy.WorkQueue)
+            {
+                stream.RemoveMessage(msg.Sequence);
+            }
         }
 
         public void ProcessPullRequests(Consumer consumer, JetStreamEntity stream)
@@ -159,8 +169,15 @@ namespace CosmoBroker.Services
                     _topicTree.PublishWithTTL(req.ReplyTo, new System.Buffers.ReadOnlySequence<byte>(msg.Payload), ackReply, remainingTtl);
                     
                     consumer.LastDeliveredSeq = msg.Sequence;
-                    consumer.InFlight[msg.Sequence] = msg;
-                    consumer.DeliveryAttempts.AddOrUpdate(msg.Sequence, 1, (_, count) => count + 1);
+                    if (consumer.Config.AckPolicy != AckPolicy.None)
+                    {
+                        consumer.InFlight[msg.Sequence] = msg;
+                        consumer.DeliveryAttempts.AddOrUpdate(msg.Sequence, 1, (_, count) => count + 1);
+                    }
+                    else if (stream.Config.Retention == RetentionPolicy.WorkQueue)
+                    {
+                        stream.RemoveMessage(msg.Sequence);
+                    }
                 }
             }
         }
@@ -213,7 +230,12 @@ namespace CosmoBroker.Services
             var consumer = stream.Consumers.FirstOrDefault(c => c.Name == consumerName);
             if (consumer == null) return;
 
-            if (consumer.InFlight.TryRemove(sequence, out _))
+            if (consumer.Config.AckPolicy == AckPolicy.All)
+            {
+                var toAck = consumer.InFlight.Keys.Where(k => k <= sequence).ToList();
+                foreach (var seq in toAck) consumer.InFlight.TryRemove(seq, out _);
+            }
+            else if (consumer.InFlight.TryRemove(sequence, out _))
             {
                 consumer.LastAckedSeq = Math.Max(consumer.LastAckedSeq, sequence);
                 
@@ -342,11 +364,18 @@ namespace CosmoBroker.Services
                     {
                         foreach (var consumer in stream.Consumers)
                         {
+                            if (consumer.Config.AckPolicy == AckPolicy.None) continue;
                             foreach (var kv in consumer.InFlight)
                             {
                                 var msg = kv.Value;
                                 if (DateTime.UtcNow - msg.Timestamp > TimeSpan.FromSeconds(consumer.Config.AckWait))
                                 {
+                                    int attempts = consumer.DeliveryAttempts.GetValueOrDefault(msg.Sequence, 0);
+                                    if (consumer.Config.MaxDeliver > 0 && attempts >= consumer.Config.MaxDeliver)
+                                    {
+                                        consumer.InFlight.TryRemove(msg.Sequence, out _);
+                                        continue;
+                                    }
                                     _ = DeliverMessage(consumer, stream, msg);
                                     msg.Timestamp = DateTime.UtcNow; 
                                 }

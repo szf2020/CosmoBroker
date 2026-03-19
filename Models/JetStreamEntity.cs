@@ -33,6 +33,9 @@ namespace CosmoBroker.JetStream.Models
 
         [System.Text.Json.Serialization.JsonPropertyName("replicas")]
         public int Replicas { get; set; } = 1;
+
+        [System.Text.Json.Serialization.JsonPropertyName("duplicate_window")]
+        public TimeSpan DuplicateWindow { get; set; } = TimeSpan.FromMinutes(2);
     }
 
     public class JetStreamEntity
@@ -40,6 +43,8 @@ namespace CosmoBroker.JetStream.Models
         public StreamConfig Config { get; }
         public long LastSequence { get; private set; } = 0;
         public long TotalBytes { get; private set; } = 0;
+
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> _dedup = new();
 
         public List<StreamMessage> Messages { get; } = new();
         public List<Consumer> Consumers { get; } = new();
@@ -86,6 +91,29 @@ namespace CosmoBroker.JetStream.Models
             ApplyRetention();
 
             return msg;
+        }
+
+        public bool IsDuplicate(string? msgId, DateTime now)
+        {
+            if (string.IsNullOrWhiteSpace(msgId)) return false;
+            if (Config.DuplicateWindow <= TimeSpan.Zero) return false;
+
+            if (_dedup.TryGetValue(msgId, out var seenAt))
+            {
+                if (now - seenAt <= Config.DuplicateWindow) return true;
+            }
+
+            _dedup[msgId] = now;
+            // Best-effort cleanup.
+            if (_dedup.Count > 10000)
+            {
+                foreach (var kv in _dedup)
+                {
+                    if (now - kv.Value > Config.DuplicateWindow)
+                        _dedup.TryRemove(kv.Key, out _);
+                }
+            }
+            return false;
         }
 
         private void ApplyRetention()

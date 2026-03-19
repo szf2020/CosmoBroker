@@ -99,4 +99,38 @@ public class JetStreamTests : TestBase
         Assert.Contains("HMSG exp sub1", resp);
         Assert.Contains("Nats-Msg-TTL: 1", resp);
     }
+
+    [Fact]
+    public async Task TestJetStreamDedupMsgId()
+    {
+        await Server.StartAsync(Cts.Token);
+        using var client1 = await CreateClientAsync();
+        using var client2 = await CreateClientAsync();
+
+        var streamConfig = new { name = "D1", subjects = new[] { "dedup" } };
+        string createJson = System.Text.Json.JsonSerializer.Serialize(streamConfig);
+        await client1.SendAsync($"PUB $JS.API.STREAM.CREATE.D1 _ {createJson.Length}\r\n{createJson}\r\n");
+        await Task.Delay(100);
+
+        string headers = "NATS/1.0\r\nNats-Msg-Id: ABC123\r\n\r\n";
+        string payload = "HI";
+        await client2.SendAsync($"HPUB dedup {headers.Length} {headers.Length + payload.Length}\r\n{headers}{payload}\r\n");
+        await client2.SendAsync($"HPUB dedup {headers.Length} {headers.Length + payload.Length}\r\n{headers}{payload}\r\n");
+
+        await client1.SendAsync("SUB JS_INFO 1\r\n");
+        for (int i = 0; i < 20; i++) {
+            if (Server.HasSubscribers("JS_INFO")) break;
+            await Task.Delay(50);
+        }
+
+        await client2.SendAsync("PUB $JS.API.STREAM.INFO.D1 JS_INFO 2\r\n{}\r\n");
+        string resp = "";
+        for (int i = 0; i < 10; i++) {
+            resp += await client1.ReadResponseAsync(1000);
+            if (resp.Contains("stream_info_response")) break;
+            await Task.Delay(100);
+        }
+
+        Assert.Contains("\"messages\":1", resp);
+    }
 }

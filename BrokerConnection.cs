@@ -455,6 +455,7 @@ public class BrokerConnection
         var headersStr = Encoding.UTF8.GetString(headersBytes);
         
         TimeSpan? ttl = null;
+        string? msgId = null;
         var lines = headersStr.Split("\r\n");
         foreach (var line in lines)
         {
@@ -463,11 +464,15 @@ public class BrokerConnection
                 if (int.TryParse(line.Substring(13).Trim(), out int seconds))
                     ttl = TimeSpan.FromSeconds(seconds);
             }
+            if (line.StartsWith("Nats-Msg-Id:", StringComparison.OrdinalIgnoreCase))
+            {
+                msgId = line.Substring(12).Trim();
+            }
         }
-        HandlePub(subject, replyTo, payload, ttl);
+        HandlePub(subject, replyTo, payload, ttl, msgId);
     }
 
-    public void HandlePub(string subject, string? replyTo, ReadOnlySequence<byte> payload, TimeSpan? ttl = null)
+    public void HandlePub(string subject, string? replyTo, ReadOnlySequence<byte> payload, TimeSpan? ttl = null, string? msgId = null)
     {
         if (!_isAuthenticated) { SendError("Authorization Violation"); return; }
         MsgIn++;
@@ -521,7 +526,7 @@ public class BrokerConnection
             if (_jetStream.HasStreams)
             {
                 foreach (var streamName in _jetStream.GetMatchingStreams(scopedSubject))
-                    _ = _jetStream.Publish(streamName, scopedSubject, payload.ToArray(), ttl);
+                    _ = _jetStream.Publish(streamName, scopedSubject, payload.ToArray(), ttl, msgId);
             }
         }
         _topicTree.PublishWithTTL(scopedSubject, payload, scopedReplyTo, ttl, this);
