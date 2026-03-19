@@ -173,4 +173,35 @@ public class JetStreamTests : TestBase
         // Should not replay 2 messages for WorkQueue retention.
         Assert.DoesNotContain("MSG deliver.a1 s1", resp2);
     }
+
+    [Fact]
+    public async Task TestMaxAckPendingLimitsDelivery()
+    {
+        await Server.StartAsync(Cts.Token);
+        using var client1 = await CreateClientAsync();
+        using var client2 = await CreateClientAsync();
+
+        var streamConfig = new { name = "P1", subjects = new[] { "pend" } };
+        await client1.SendAsync($"PUB $JS.API.STREAM.CREATE.P1 _ {System.Text.Json.JsonSerializer.Serialize(streamConfig).Length}\r\n{System.Text.Json.JsonSerializer.Serialize(streamConfig)}\r\n");
+        await Task.Delay(100);
+
+        var consumerConfig = new { durable_name = "C1", deliver_subject = "deliver.p1", max_ack_pending = 2 };
+        await client1.SendAsync($"PUB $JS.API.CONSUMER.CREATE.P1.C1 _ {System.Text.Json.JsonSerializer.Serialize(consumerConfig).Length}\r\n{System.Text.Json.JsonSerializer.Serialize(consumerConfig)}\r\n");
+        await Task.Delay(100);
+
+        await client1.SendAsync("SUB deliver.p1 s1\r\n");
+        await Task.Delay(100);
+
+        await client2.SendAsync("PUB pend 2\r\nok\r\n");
+        await client2.SendAsync("PUB pend 2\r\nok\r\n");
+        await client2.SendAsync("PUB pend 2\r\nok\r\n");
+        await Task.Delay(200);
+
+        var resp = await client1.ReadResponseAsync();
+        int count = 0;
+        int idx = 0;
+        while ((idx = resp.IndexOf("MSG", idx)) != -1) { count++; idx++; }
+
+        Assert.True(count <= 2);
+    }
 }

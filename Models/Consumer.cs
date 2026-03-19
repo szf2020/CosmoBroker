@@ -43,6 +43,9 @@ namespace CosmoBroker.JetStream.Models
 
         [System.Text.Json.Serialization.JsonPropertyName("filter_subject")]
         public string FilterSubject { get; set; } = ">";
+
+        [System.Text.Json.Serialization.JsonPropertyName("max_ack_pending")]
+        public int MaxAckPending { get; set; } = 1024;
     }
 
     public class Consumer

@@ -137,6 +137,9 @@ namespace CosmoBroker.Services
                 if (remainingTtl.Value.TotalSeconds <= 0) return; // Expired already
             }
 
+            if (consumer.Config.AckPolicy != AckPolicy.None && consumer.InFlight.Count >= consumer.Config.MaxAckPending)
+                return;
+
             _topicTree.PublishWithTTL(consumer.DeliverSubject ?? "", new System.Buffers.ReadOnlySequence<byte>(msg.Payload), ackReply, remainingTtl);
 
             consumer.LastDeliveredSeq = msg.Sequence;
@@ -182,8 +185,11 @@ namespace CosmoBroker.Services
                     consumer.LastDeliveredSeq = msg.Sequence;
                     if (consumer.Config.AckPolicy != AckPolicy.None)
                     {
-                        consumer.InFlight[msg.Sequence] = msg;
-                        consumer.DeliveryAttempts.AddOrUpdate(msg.Sequence, 1, (_, count) => count + 1);
+                        if (consumer.InFlight.Count < consumer.Config.MaxAckPending)
+                        {
+                            consumer.InFlight[msg.Sequence] = msg;
+                            consumer.DeliveryAttempts.AddOrUpdate(msg.Sequence, 1, (_, count) => count + 1);
+                        }
                     }
                     else if (stream.Config.Retention == RetentionPolicy.WorkQueue)
                     {
