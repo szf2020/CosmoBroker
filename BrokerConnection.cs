@@ -10,12 +10,14 @@ using System.Linq;
 using System.Collections.Generic;
 using System.IO;
 using System.Threading;
+using NATS.NKeys;
 
 namespace CosmoBroker;
 
 public class BrokerConnection
 {
     private const int MaxPayloadBytes = 1048576;
+    private const string DefaultNonce = "secure_nonce_12345";
     private readonly Stream _stream;
     private readonly bool _sendInfoOnConnect;
     private readonly string _remoteEndPoint;
@@ -160,7 +162,7 @@ public class BrokerConnection
     public async Task SendInfo()
     {
         bool authRequired = _authenticator != null;
-        string nonce = "secure_nonce_12345";
+        string nonce = DefaultNonce;
         bool ldm = _server?.GetVarz() is { } v && (bool)((dynamic)v).lame_duck_mode;
         
         string infoJson = $"{{\"server_id\":\"cosmo-broker\",\"version\":\"1.0.0\",\"auth_required\":{authRequired.ToString().ToLower()},\"nonce\":\"{nonce}\",\"lame_duck_mode\":{ldm.ToString().ToLower()},\"headers\":true,\"max_payload\":1048576}}";
@@ -545,6 +547,25 @@ public class BrokerConnection
         NoEcho = options.NoEcho;
         if (_authenticator != null)
         {
+            if (!string.IsNullOrEmpty(options.Nkey))
+            {
+                if (string.IsNullOrEmpty(options.Sig))
+                {
+                    SendError("Missing NKEY signature");
+                    await Task.Delay(50);
+                    _stream.Close();
+                    return;
+                }
+
+                if (!VerifyEd25519Signature(options.Nkey, options.Sig, DefaultNonce))
+                {
+                    SendError("Invalid NKEY signature");
+                    await Task.Delay(50);
+                    _stream.Close();
+                    return;
+                }
+            }
+
             if (_certAuthenticated && _authenticator is Auth.X509Authenticator)
             {
                 var ok = "+OK\r\n"u8;
@@ -696,6 +717,36 @@ public class BrokerConnection
         Interlocked.Add(ref _bytesOutTotal, err.Length);
         _writerPipe.Writer.Write(err);
         _ = _writerPipe.Writer.FlushAsync();
+    }
+
+    private static bool VerifyEd25519Signature(string publicKey, string signature, string data)
+    {
+        if (string.IsNullOrWhiteSpace(publicKey) || string.IsNullOrWhiteSpace(signature)) return false;
+        try
+        {
+            var kp = KeyPair.FromPublicKey(publicKey);
+            var sig = DecodeBase64Any(signature);
+            var bytes = Encoding.UTF8.GetBytes(data);
+            return kp.Verify(bytes, sig);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static byte[] DecodeBase64Any(string input)
+    {
+        if (input.Contains('-') || input.Contains('_'))
+            return Base64UrlDecode(input);
+        return Convert.FromBase64String(input);
+    }
+
+    private static byte[] Base64UrlDecode(string input)
+    {
+        string padded = input.PadRight(input.Length + (4 - input.Length % 4) % 4, '=');
+        string base64 = padded.Replace('-', '+').Replace('_', '/');
+        return Convert.FromBase64String(base64);
     }
 
     private void Cleanup()
