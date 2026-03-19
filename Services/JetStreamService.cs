@@ -67,6 +67,7 @@ namespace CosmoBroker.Services
                     _ = Task.Run(async () => {
                         long offset = await _repo.GetConsumerOffsetAsync(consumer.Name);
                         consumer.LastDeliveredSeq = offset;
+                        consumer.LastAckedSeq = offset;
                         if (!consumer.IsPull) ReplayMissedMessages(consumer, stream);
                     });
                 }
@@ -234,6 +235,15 @@ namespace CosmoBroker.Services
             {
                 var toAck = consumer.InFlight.Keys.Where(k => k <= sequence).ToList();
                 foreach (var seq in toAck) consumer.InFlight.TryRemove(seq, out _);
+                consumer.LastAckedSeq = Math.Max(consumer.LastAckedSeq, sequence);
+                if (_repo != null)
+                {
+                    _ = _repo.UpdateConsumerOffsetAsync(consumer.Name, streamName, consumer.LastAckedSeq);
+                }
+                if (stream.Config.Retention == RetentionPolicy.WorkQueue)
+                {
+                    foreach (var seq in toAck) stream.RemoveMessage(seq);
+                }
             }
             else if (consumer.InFlight.TryRemove(sequence, out _))
             {
@@ -257,12 +267,20 @@ namespace CosmoBroker.Services
             var consumer = stream.Consumers.FirstOrDefault(c => c.Name == consumerName);
             if (consumer == null) return;
 
+            if (consumer.InFlight.TryRemove(sequence, out _))
+            {
+                consumer.LastDeliveredSeq = Math.Max(consumer.LastDeliveredSeq - 1, 0);
+            }
             if (consumer.InFlight.TryGetValue(sequence, out var msg))
             {
                 int attempts = consumer.DeliveryAttempts.GetValueOrDefault(sequence, 0);
                 if (consumer.Config.MaxDeliver > 0 && attempts >= consumer.Config.MaxDeliver)
                 {
                     consumer.InFlight.TryRemove(sequence, out _);
+                    if (stream.Config.Retention == RetentionPolicy.WorkQueue)
+                    {
+                        stream.RemoveMessage(sequence);
+                    }
                     return;
                 }
 
