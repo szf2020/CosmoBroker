@@ -71,7 +71,7 @@ public class BrokerConnection
     private static readonly long MaxBufferedBytes =
         long.TryParse(Environment.GetEnvironmentVariable("COSMOBROKER_MAX_BUFFER_BYTES"), out var maxBuf)
             ? maxBuf
-            : 64L * 1024 * 1024; // 64MB default backpressure limit
+            : 512L * 1024 * 1024; // 512MB default backpressure limit
     private const int SendBatchBytes = 64 * 1024;
     private const int SendBatchMaxItems = 128;
 
@@ -123,7 +123,11 @@ public class BrokerConnection
         _authenticator = authenticator;
         _jetStream = jetStream ?? new Services.JetStreamService(_topicTree, _repo);
         _server = server;
-        _readerPipe = new Pipe();
+        _readerPipe = new Pipe(new PipeOptions(
+            pauseWriterThreshold: 64 * 1024 * 1024,  // 64MB pause threshold
+            resumeWriterThreshold: 32 * 1024 * 1024, // 32MB resume threshold
+            useSynchronizationContext: false
+        ));
         _sendQueue = Channel.CreateUnbounded<OutboundBuffer>(new UnboundedChannelOptions
         {
             SingleReader = true,

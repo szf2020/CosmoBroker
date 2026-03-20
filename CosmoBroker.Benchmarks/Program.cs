@@ -62,11 +62,11 @@ class Program
         for (int p = 0; p < options.Publishers; p++)
         {
             var toSend = perPublisher + (p == 0 ? remainder : 0);
-            publishers.Add(Task.Run(() =>
+            publishers.Add(Task.Run(async () =>
             {
                 for (int i = 0; i < toSend; i++)
                 {
-                    _ = pubConn.PublishAsync("bench.foo", payload);
+                    await pubConn.PublishAsync("bench.foo", payload);
                 }
             }));
         }
