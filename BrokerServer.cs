@@ -94,8 +94,10 @@ public class BrokerServer : IAsyncDisposable
         _monitor.Start(_cts.Token);
 
         _listenSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        _listenSocket.ReceiveBufferSize = 8 * 1024 * 1024; // 8MB buffer
+        _listenSocket.SendBufferSize = 8 * 1024 * 1024;    // 8MB buffer
         _listenSocket.Bind(new IPEndPoint(IPAddress.Any, _port));
-        _listenSocket.Listen(1000);
+        _listenSocket.Listen(10000); // Increased from 1000
 
         Console.WriteLine($"[CosmoBroker] Listening on port {_port} {( _serverCertificate != null ? "(TLS enabled)" : "" )}...");
         _acceptTask = AcceptLoopAsync(_cts.Token);
@@ -129,6 +131,7 @@ public class BrokerServer : IAsyncDisposable
     }
     public bool TryMatchSublistLiteral(ReadOnlySpan<byte> subject, out List<Sublist.SubEntry> psubs, out Dictionary<string, Sublist.QueueGroup> qsubs) => _sublist.TryMatchLiteral(subject, out psubs, out qsubs);
     public bool SublistHasWildcards => _sublist.HasWildcards;
+    public long SublistVersion => _sublist.Version;
 
     public void NotifyUnsubscription(string sid)
     {
@@ -169,6 +172,8 @@ public class BrokerServer : IAsyncDisposable
             {
                 var socket = await _listenSocket!.AcceptAsync(ct);
                 socket.NoDelay = true;
+                socket.ReceiveBufferSize = 8 * 1024 * 1024;
+                socket.SendBufferSize = 8 * 1024 * 1024;
                 Interlocked.Increment(ref _totalConnections);
                 
                 _ = Task.Run(async () => {

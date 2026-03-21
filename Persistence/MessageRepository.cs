@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using CosmoSQLClient.Core;
 using CosmoSQLClient.Sqlite;
@@ -14,12 +15,25 @@ public class MessageRepository
 {
     private readonly ISqlDatabase _db;
     private readonly DatabaseProvider _provider;
+    private readonly Channel<JetStreamWrite>? _jsWriteChannel;
+    private readonly Task? _jsWriteLoop;
 
-    public MessageRepository(string connectionString, DatabaseProvider? provider = null, int maxConnections = 5)
+    private readonly int _jsBatchSize;
+    private readonly TimeSpan _jsBatchMaxDelay;
+
+    public MessageRepository(
+        string connectionString,
+        DatabaseProvider? provider = null,
+        int maxConnections = 5,
+        int? jetStreamBatchSize = null,
+        int? jetStreamBatchDelayMs = null)
     {
         var resolved = ResolveProvider(connectionString, provider);
         _provider = resolved.Provider;
         var cs = resolved.ConnectionString;
+
+        _jsBatchSize = ResolveJetStreamBatchSize(jetStreamBatchSize);
+        _jsBatchMaxDelay = ResolveJetStreamBatchDelay(jetStreamBatchDelayMs);
 
         _db = _provider switch
         {
@@ -27,10 +41,25 @@ public class MessageRepository
             DatabaseProvider.Postgres => new PostgresConnectionPool(PostgresConfiguration.Parse(cs), maxConnections: maxConnections),
             _ => new SqliteConnectionPool(SqliteConfiguration.Parse(cs), maxConnections: maxConnections)
         };
+
+        if (_provider == DatabaseProvider.Sqlite)
+        {
+            _jsWriteChannel = Channel.CreateUnbounded<JetStreamWrite>(new UnboundedChannelOptions
+            {
+                SingleReader = true,
+                SingleWriter = false
+            });
+            _jsWriteLoop = Task.Run(JetStreamWriteLoopAsync);
+        }
     }
 
     public async Task InitializeAsync(CancellationToken ct = default)
     {
+        if (_provider == DatabaseProvider.Sqlite)
+        {
+            await ApplySqlitePragmasAsync(ct);
+        }
+
         var schema = _provider switch
         {
             DatabaseProvider.MsSql => MsSqlSchema,
@@ -80,7 +109,9 @@ public class MessageRepository
                 deny_sub       TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_mq_messages_subject ON mq_messages(subject);
-            CREATE INDEX IF NOT EXISTS idx_mq_messages_stream ON mq_messages(stream_name);";
+            CREATE INDEX IF NOT EXISTS idx_mq_messages_stream ON mq_messages(stream_name);
+            CREATE INDEX IF NOT EXISTS idx_mq_messages_stream_id ON mq_messages(stream_name, id);
+            CREATE INDEX IF NOT EXISTS idx_mq_messages_subject_id ON mq_messages(subject, id);";
 
     private const string PostgresSchema = @"
             CREATE TABLE IF NOT EXISTS mq_messages (
@@ -117,7 +148,9 @@ public class MessageRepository
                 deny_sub       TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_mq_messages_subject ON mq_messages(subject);
-            CREATE INDEX IF NOT EXISTS idx_mq_messages_stream ON mq_messages(stream_name);";
+            CREATE INDEX IF NOT EXISTS idx_mq_messages_stream ON mq_messages(stream_name);
+            CREATE INDEX IF NOT EXISTS idx_mq_messages_stream_id ON mq_messages(stream_name, id);
+            CREATE INDEX IF NOT EXISTS idx_mq_messages_subject_id ON mq_messages(subject, id);";
 
     private const string MsSqlSchema = @"
             IF OBJECT_ID('mq_messages', 'U') IS NULL
@@ -161,7 +194,11 @@ public class MessageRepository
             IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'idx_mq_messages_subject' AND object_id = OBJECT_ID('mq_messages'))
             CREATE INDEX idx_mq_messages_subject ON mq_messages(subject);
             IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'idx_mq_messages_stream' AND object_id = OBJECT_ID('mq_messages'))
-            CREATE INDEX idx_mq_messages_stream ON mq_messages(stream_name);";
+            CREATE INDEX idx_mq_messages_stream ON mq_messages(stream_name);
+            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'idx_mq_messages_stream_id' AND object_id = OBJECT_ID('mq_messages'))
+            CREATE INDEX idx_mq_messages_stream_id ON mq_messages(stream_name, id);
+            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'idx_mq_messages_subject_id' AND object_id = OBJECT_ID('mq_messages'))
+            CREATE INDEX idx_mq_messages_subject_id ON mq_messages(subject, id);";
 
     public async Task AddUserAsync(string username, string password, string? token = null, CancellationToken ct = default)
     {
@@ -327,6 +364,22 @@ public class MessageRepository
 
     public async Task<long> SaveJetStreamMessageAsync(string streamName, string subject, byte[] payload, CancellationToken ct = default)
     {
+        if (_provider == DatabaseProvider.Sqlite && _jsWriteChannel != null)
+        {
+            if (ct.IsCancellationRequested) return await Task.FromCanceled<long>(ct);
+            var tcs = new TaskCompletionSource<long>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var write = new JetStreamWrite(streamName, subject, payload, tcs);
+            try
+            {
+                await _jsWriteChannel.Writer.WriteAsync(write, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                tcs.TrySetCanceled(ct);
+            }
+            return await tcs.Task;
+        }
+
         var sql = _provider switch
         {
             DatabaseProvider.Postgres => "INSERT INTO mq_messages (subject, payload, stream_name) VALUES (@subject, @payload, @stream) RETURNING id",
@@ -341,6 +394,107 @@ public class MessageRepository
         }, ct: ct);
 
         return rows[0]["id"].AsInt() ?? 0;
+    }
+
+    private async Task ApplySqlitePragmasAsync(CancellationToken ct)
+    {
+        // Safe-profile pragmas: durable, WAL-based, and tuned for throughput.
+        await _db.ExecuteAsync("PRAGMA journal_mode=WAL;", ct: ct);
+        await _db.ExecuteAsync("PRAGMA synchronous=FULL;", ct: ct);
+        await _db.ExecuteAsync("PRAGMA temp_store=MEMORY;", ct: ct);
+        await _db.ExecuteAsync("PRAGMA cache_size=-200000;", ct: ct);
+        await _db.ExecuteAsync("PRAGMA mmap_size=268435456;", ct: ct);
+        await _db.ExecuteAsync("PRAGMA busy_timeout=5000;", ct: ct);
+    }
+
+    private async Task JetStreamWriteLoopAsync()
+    {
+        if (_jsWriteChannel == null) return;
+        var reader = _jsWriteChannel.Reader;
+        var batch = new List<JetStreamWrite>(_jsBatchSize);
+
+        while (await reader.WaitToReadAsync())
+        {
+            if (!reader.TryRead(out var first)) continue;
+            batch.Add(first);
+
+            var delayTask = Task.Delay(_jsBatchMaxDelay);
+            while (batch.Count < _jsBatchSize)
+            {
+                while (reader.TryRead(out var item))
+                {
+                    batch.Add(item);
+                    if (batch.Count >= _jsBatchSize) break;
+                }
+                if (batch.Count >= _jsBatchSize) break;
+
+                var waitTask = reader.WaitToReadAsync().AsTask();
+                var completed = await Task.WhenAny(waitTask, delayTask);
+                if (completed == delayTask) break;
+                if (!waitTask.Result) break;
+            }
+
+            await PersistJetStreamBatchAsync(batch);
+            batch.Clear();
+        }
+    }
+
+    private async Task PersistJetStreamBatchAsync(List<JetStreamWrite> batch)
+    {
+        if (batch.Count == 0) return;
+        try
+        {
+            await _db.ExecuteAsync("BEGIN IMMEDIATE;");
+            foreach (var item in batch)
+            {
+                var rows = await _db.QueryAsync(
+                    "INSERT INTO mq_messages (subject, payload, stream_name) VALUES (@subject, @payload, @stream); SELECT last_insert_rowid() as id;",
+                    new[] {
+                        SqlParameter.Named("subject", SqlValue.From(item.Subject)),
+                        SqlParameter.Named("payload", SqlValue.From(item.Payload)),
+                        SqlParameter.Named("stream", SqlValue.From(item.StreamName))
+                    });
+                var id = rows[0]["id"].AsInt() ?? 0;
+                item.Tcs.TrySetResult(id);
+            }
+            await _db.ExecuteAsync("COMMIT;");
+        }
+        catch (Exception ex)
+        {
+            try { await _db.ExecuteAsync("ROLLBACK;"); } catch { }
+            foreach (var item in batch)
+            {
+                item.Tcs.TrySetException(ex);
+            }
+        }
+    }
+
+    public async Task FlushAsync(CancellationToken ct = default)
+    {
+        if (_jsWriteChannel == null || _jsWriteLoop == null) return;
+        _jsWriteChannel.Writer.TryComplete();
+        using var reg = ct.Register(() => _jsWriteChannel.Writer.TryComplete());
+        try
+        {
+            await _jsWriteLoop;
+        }
+        catch { }
+    }
+
+    private static int ResolveJetStreamBatchSize(int? overrideValue)
+    {
+        if (overrideValue.HasValue && overrideValue.Value > 0) return overrideValue.Value;
+        if (int.TryParse(Environment.GetEnvironmentVariable("COSMOBROKER_JS_BATCH_SIZE"), out var env) && env > 0)
+            return env;
+        return 128;
+    }
+
+    private static TimeSpan ResolveJetStreamBatchDelay(int? overrideMs)
+    {
+        if (overrideMs.HasValue && overrideMs.Value >= 0) return TimeSpan.FromMilliseconds(overrideMs.Value);
+        if (int.TryParse(Environment.GetEnvironmentVariable("COSMOBROKER_JS_BATCH_DELAY_MS"), out var env) && env >= 0)
+            return TimeSpan.FromMilliseconds(env);
+        return TimeSpan.FromMilliseconds(2);
     }
 
     public async Task<List<PersistedMessage>> GetJetStreamMessagesAsync(string streamName, long startAfterId, int limit = 100, CancellationToken ct = default)
@@ -432,3 +586,5 @@ public class PersistedMessage
     public required string Subject { get; set; }
     public required byte[] Payload { get; set; }
 }
+
+internal sealed record JetStreamWrite(string StreamName, string Subject, byte[] Payload, TaskCompletionSource<long> Tcs);

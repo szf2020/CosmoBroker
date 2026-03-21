@@ -19,6 +19,28 @@ CosmoBroker is optimized for high-throughput and low-latency workloads. In stand
 
 ---
 
+### SQLite JetStream Tuning (Safe Profile)
+For SQLite persistence, JetStream writes are batched for durable throughput. You can tune batching via:
+- `COSMOBROKER_JS_BATCH_SIZE` (default `128`)
+- `COSMOBROKER_JS_BATCH_DELAY_MS` (default `2`)
+
+You can also set these in a config file:
+```
+jetstream {
+  batch_size: 256
+  batch_delay_ms: 1
+}
+```
+Then apply them when creating the repository:
+```csharp
+var config = Services.ConfigParser.LoadFile("broker.conf");
+var repo = new MessageRepository(
+    "Data Source=broker.db;",
+    jetStreamBatchSize: config.JetStreamBatchSize,
+    jetStreamBatchDelayMs: config.JetStreamBatchDelayMs
+);
+```
+
 ## Key Features
 
 ### 🚀 NATS Protocol & Advanced Streaming
@@ -57,6 +79,45 @@ var broker = new BrokerServer(port: 4222);
 await broker.StartAsync();
 
 Console.WriteLine("CosmoBroker is running. Connect with any NATS client!");
+```
+
+### Config File + SQLite JetStream Tuning
+Set `COSMOBROKER_CONFIG` to point at a config file and `COSMOBROKER_REPO` to enable SQLite persistence.
+
+Example `broker.conf`:
+```
+port: 4222
+jetstream {
+  batch_size: 256
+  batch_delay_ms: 1
+}
+```
+
+Run:
+```bash
+COSMOBROKER_CONFIG=broker.conf COSMOBROKER_REPO="Data Source=broker.db;" dotnet run --project CosmoBroker.Server -c Release
+```
+
+### TLS/Auth Via Config
+Example `broker.conf` with TLS + SQL auth + JetStream batching:
+```
+port: 4222
+repo: "Data Source=broker.db;"
+
+tls {
+  cert: "server.pfx"
+  password: "password"
+  client_cert_required: false
+}
+
+auth {
+  type: "sql"
+}
+
+jetstream {
+  batch_size: 256
+  batch_delay_ms: 1
+}
 ```
 
 ### Advanced Setup (JetStream + SQL + TLS)

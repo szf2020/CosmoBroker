@@ -41,7 +41,7 @@ public class BrokerConnection
     private readonly Services.JetStreamService _jetStream;
     private readonly BrokerServer? _server;
     private readonly Pipe _readerPipe;
-    private readonly Channel<OutboundBuffer> _sendQueue;
+    private readonly Pipe _sendPipe;
     
     public enum ProtocolType
     {
@@ -82,14 +82,15 @@ public class BrokerConnection
     private static readonly long MaxBufferedBytes =
         long.TryParse(Environment.GetEnvironmentVariable("COSMOBROKER_MAX_BUFFER_BYTES"), out var maxBuf)
             ? maxBuf
-            : 512L * 1024 * 1024; // 512MB default backpressure limit
-    private static readonly long SoftLimitBytes = MaxBufferedBytes / 2;
-    private const int SendBatchBytes = 64 * 1024;
+            : 1024L * 1024 * 1024; // 1GB default headroom
+    private static readonly long SoftLimitBytes = (MaxBufferedBytes * 7) / 8; // 87.5% limit
+    private const int SendBatchBytes = 128 * 1024; // 128KB batching
     private const int SendBatchMaxItems = 128;
 
     // Optimization: Per-connection byte cache for strings to avoid re-encoding
     private readonly ConcurrentDictionary<string, byte[]> _stringByteCache = new();
     private static readonly ThreadLocal<L1MatchCache> MatchCache = new(() => new L1MatchCache());
+    private static readonly ThreadLocal<HashSet<BrokerConnection>> TouchedConnections = new(() => new HashSet<BrokerConnection>());
 
     public object GetStats() => new {
         protocol = _protocol.ToString(),
@@ -110,7 +111,7 @@ public class BrokerConnection
         public int? MaxMsgs { get; set; }
         public int ReceivedMsgs { get; set; }
         public bool IsRemote { get; set; } = false;
-        public byte[]? CachedPrefix { get; set; }
+        public byte[]? CachedSidPart { get; set; } // " <sid> " encoded
     }
 
     private readonly ConcurrentDictionary<string, Subscription> _subscriptions = new();
@@ -138,16 +139,15 @@ public class BrokerConnection
         _jetStream = jetStream ?? new Services.JetStreamService(_topicTree, _repo);
         _server = server;
         _readerPipe = new Pipe(new PipeOptions(
-            pauseWriterThreshold: 64 * 1024 * 1024,  // 64MB pause threshold
-            resumeWriterThreshold: 32 * 1024 * 1024, // 32MB resume threshold
+            pauseWriterThreshold: 64 * 1024 * 1024,
+            resumeWriterThreshold: 32 * 1024 * 1024,
             useSynchronizationContext: false
         ));
-        _sendQueue = Channel.CreateUnbounded<OutboundBuffer>(new UnboundedChannelOptions
-        {
-            SingleReader = true,
-            SingleWriter = false,
-            AllowSynchronousContinuations = true
-        });
+        _sendPipe = new Pipe(new PipeOptions(
+            pauseWriterThreshold: MaxBufferedBytes,
+            resumeWriterThreshold: SoftLimitBytes,
+            useSynchronizationContext: false
+        ));
         _sendInfoOnConnect = sendInfoOnConnect;
 
         if (_authenticator == null)
@@ -162,7 +162,7 @@ public class BrokerConnection
     {
         var readTask = FillPipeAsync(_stream, _readerPipe.Writer);
         var processTask = ProcessPipeAsync(_readerPipe.Reader);
-        var sendTask = SendLoopAsync(_stream, _sendQueue.Reader);
+        var sendTask = SendLoopAsync(_stream, _sendPipe.Reader);
 
         if (_sendInfoOnConnect)
         {
@@ -225,7 +225,7 @@ public class BrokerConnection
 
     private async Task FillPipeAsync(Stream stream, PipeWriter writer)
     {
-        const int minimumBufferSize = 512;
+        const int minimumBufferSize = 1024;
         try
         {
             while (true)
@@ -244,11 +244,12 @@ public class BrokerConnection
         finally { await writer.CompleteAsync(); }
     }
 
-    private bool ProcessPubPayload(ref ReadOnlySequence<byte> buffer, SequencePosition linePosition, ReadOnlySpan<byte> subject, ReadOnlySpan<byte> replyTo, int totalLength, int headerLen, bool isHPub)
+    private bool ProcessPubPayload(ref ReadOnlySequence<byte> buffer, SequencePosition linePosition, ReadOnlySpan<byte> subject, ReadOnlySpan<byte> replyTo, int totalLength, int headerLen, bool isHPub, HashSet<BrokerConnection> touched, out bool accepted)
     {
         var pubStart = PerfEnabled ? Stopwatch.GetTimestamp() : 0L;
         var payloadStart = buffer.GetPosition(1, linePosition);
         var remaining = buffer.Slice(payloadStart);
+        accepted = true;
 
         if (totalLength > MaxPayloadBytes)
         {
@@ -269,14 +270,15 @@ public class BrokerConnection
             if (!isHPub && _jetStream.HasStreams == false && (Account == null || string.IsNullOrEmpty(Account.SubjectPrefix)))
             {
                 var l1 = MatchCache.Value!;
-                var (res, dhSubjectStr) = l1.Get(subject);
+                long subVersion = _server!.SublistVersion;
+                var (res, dhSubjectStr) = l1.Get(subject, subVersion);
                 
                 if (res == null)
                 {
                     if (_server!.SublistHasWildcards == false &&
                         _server.TryMatchSublistLiteral(subject, out var dhLpsubs, out var dhLqsubs))
                     {
-                        res = new Sublist.SublistResult();
+                        res = new Sublist.SublistResult { Version = subVersion };
                         res.Psubs.AddRange(dhLpsubs);
                         foreach(var q in dhLqsubs.Values) res.Qsubs.Add(q);
                     }
@@ -285,47 +287,63 @@ public class BrokerConnection
                         res = _server.MatchSublist(subject);
                     }
                     dhSubjectStr = GetCachedSubjectString(subject);
-                    l1.Set(subject, res, dhSubjectStr);
+                    l1.Set(subject, res, dhSubjectStr, subVersion);
                 }
 
-                if (res.Qsubs.Count == 0)
+                if (res != null)
                 {
                     var m0 = PerfEnabled ? Stopwatch.GetTimestamp() : 0L;
-                    if (res.Psubs.Count == 0)
+
+                    // 1. Deliver to individual subscribers (Psubs)
+                    if (res.Psubs.Count > 0)
                     {
-                        // Fallback to topic tree
-                        _topicTree.Publish(subject, fullPayload, replyToStr, this);
-                    }
-                    else
-                    {
-                        // Direct handoff for non-queue subscriptions
-                        bool accepted = true;
                         foreach (var sub in res.Psubs)
                         {
                             if (sub.Conn == this && NoEcho) continue;
                             if ((IsRoute || IsLeaf) && (sub.Conn.IsRoute || sub.Conn.IsLeaf)) continue;
-                            if (!sub.Conn.SendMessageWithTTL(dhSubjectStr!, sub.Sid, fullPayload, replyToStr, null))
-                            {
+                            if (!sub.Conn.SendMessageWithTTL(subject, sub.Sid, fullPayload, replyToStr, null))
                                 accepted = false;
-                            }
-                        }
-                        
-                        // If any consumer is slow, slow down this producer
-                        if (!accepted)
-                        {
-                            Thread.SpinWait(100);
+                            
+                            touched.Add(sub.Conn);
                         }
                     }
+
+                    // 2. Deliver to queue groups (Qsubs)
+                    if (res.Qsubs.Count > 0)
+                    {
+                        foreach (var group in res.Qsubs)
+                        {
+                            int count = group.Members.Count;
+                            if (count == 0) continue;
+
+                            int startIdx = (int)((uint)group.NextIndex() % (uint)count);
+                            for (int i = 0; i < count; i++)
+                            {
+                                var sub = group.Members[(startIdx + i) % count];
+                                if (sub.Conn == this && NoEcho) continue;
+                                if ((IsRoute || IsLeaf) && (sub.Conn.IsRoute || sub.Conn.IsLeaf)) continue;
+
+                                if (sub.Conn.SendMessageWithTTL(subject, sub.Sid, fullPayload, replyToStr, null))
+                                {
+                                    touched.Add(sub.Conn);
+                                    break;
+                                }
+                                else accepted = false;
+                            }
+                        }
+                    }
+
+                    if (res.Psubs.Count == 0 && res.Qsubs.Count == 0)
+                    {
+                        if (!_topicTree.PublishWithTTL(subject, fullPayload, replyToStr, null, this))
+                            accepted = false;
+                    }
+
                     if (PerfEnabled)
                     {
                         Interlocked.Add(ref _perfMatchNs, ElapsedNs(m0));
                         Interlocked.Increment(ref _perfMatchCount);
                     }
-                }
-                else
-                {
-                    // Complex matching or queue groups: fallback to original path for now
-                    _topicTree.Publish(subject, fullPayload, replyToStr, this);
                 }
             }
             else
@@ -349,12 +367,14 @@ public class BrokerConnection
 
     private async Task ProcessPipeAsync(PipeReader reader)
     {
+        var touched = TouchedConnections.Value!;
         try
         {
             while (true)
             {
                 var result = await reader.ReadAsync();
                 var buffer = result.Buffer;
+                touched.Clear();
 
                 while (true)
                 {
@@ -445,13 +465,21 @@ public class BrokerConnection
                                         var replyTo = rest.Slice(0, space3);
                                         if (Utf8Parser.TryParse(rest.Slice(space3 + 1), out totalLength, out _))
                                         {
-                                            if (ProcessPubPayload(ref buffer, linePosition.Value, subject, replyTo, totalLength, 0, false)) continue;
+                                            if (ProcessPubPayload(ref buffer, linePosition.Value, subject, replyTo, totalLength, 0, false, touched, out bool acc)) 
+                                            {
+                                                if (!acc) await Task.Yield();
+                                                continue; 
+                                            }
                                             else break;
                                         }
                                     }
                                     else if (Utf8Parser.TryParse(rest, out totalLength, out _))
                                     {
-                                        if (ProcessPubPayload(ref buffer, linePosition.Value, subject, default, totalLength, 0, false)) continue;
+                                        if (ProcessPubPayload(ref buffer, linePosition.Value, subject, default, totalLength, 0, false, touched, out bool acc))
+                                        {
+                                            if (!acc) await Task.Yield();
+                                            continue;
+                                        }
                                         else break;
                                     }
                                 }
@@ -483,7 +511,11 @@ public class BrokerConnection
                                             if (Utf8Parser.TryParse(nextPart.Slice(0, space4), out int headerLen, out _) && 
                                                 Utf8Parser.TryParse(nextPart.Slice(space4 + 1), out int totalLen, out _))
                                             {
-                                                if (ProcessPubPayload(ref buffer, linePosition.Value, subject, replyTo, totalLen, headerLen, true)) continue;
+                                                if (ProcessPubPayload(ref buffer, linePosition.Value, subject, replyTo, totalLen, headerLen, true, touched, out bool acc))
+                                                {
+                                                    if (!acc) await Task.Yield();
+                                                    continue;
+                                                }
                                                 else break;
                                             }
                                         }
@@ -493,7 +525,11 @@ public class BrokerConnection
                                             if (Utf8Parser.TryParse(rest.Slice(0, space3), out int headerLen, out _) && 
                                                 Utf8Parser.TryParse(rest.Slice(space3 + 1), out int totalLen, out _))
                                             {
-                                                if (ProcessPubPayload(ref buffer, linePosition.Value, subject, default, totalLen, headerLen, true)) continue;
+                                                if (ProcessPubPayload(ref buffer, linePosition.Value, subject, default, totalLen, headerLen, true, touched, out bool acc))
+                                                {
+                                                    if (!acc) await Task.Yield();
+                                                    continue;
+                                                }
                                                 else break;
                                             }
                                         }
@@ -506,6 +542,10 @@ public class BrokerConnection
                     NatsParser.ParseCommand(this, line, ref buffer, out bool _);
                     buffer = buffer.Slice(buffer.GetPosition(1, linePosition.Value));
                 }
+
+                // Global Batch Flush for this cycle
+                foreach (var conn in touched) _ = conn._sendPipe.Writer.FlushAsync();
+                _ = _sendPipe.Writer.FlushAsync();
 
                 reader.AdvanceTo(buffer.Start, buffer.End);
                 if (result.IsCompleted) break;
@@ -592,55 +632,60 @@ public class BrokerConnection
         return true;
     }
 
-    private async Task SendLoopAsync(Stream stream, ChannelReader<OutboundBuffer> reader)
+    private async Task SendLoopAsync(Stream stream, PipeReader reader)
     {
-        var batch = new List<OutboundBuffer>(SendBatchMaxItems);
+        var socket = (stream as NetworkStream)?.Socket;
+        var batch = new List<ArraySegment<byte>>(SendBatchMaxItems);
+        
         try
         {
-            while (await reader.WaitToReadAsync())
+            while (true)
             {
-                while (reader.TryRead(out var first))
+                var result = await reader.ReadAsync();
+                var buffer = result.Buffer;
+                if (buffer.IsEmpty && result.IsCompleted) break;
+
+                try
                 {
-                    batch.Clear();
-                    batch.Add(first);
-                    var total = first.Length;
-
-                    while (total < SendBatchBytes && batch.Count < SendBatchMaxItems && reader.TryRead(out var next))
+                    if (socket != null && buffer.Length > 1024)
                     {
-                        batch.Add(next);
-                        total += next.Length;
-                    }
-
-                    if (batch.Count == 1)
-                    {
-                        await stream.WriteAsync(first.Buffer.AsMemory(0, first.Length));
+                        // Gathering I/O for high-volume batches
+                        batch.Clear();
+                        long totalBatchSize = 0;
+                        foreach (var memory in buffer)
+                        {
+                            if (System.Runtime.InteropServices.MemoryMarshal.TryGetArray(memory, out var segment))
+                            {
+                                batch.Add(segment);
+                                totalBatchSize += segment.Count;
+                            }
+                        }
+                        if (batch.Count > 0)
+                        {
+                            await socket.SendAsync(batch, SocketFlags.None);
+                            Interlocked.Add(ref _pendingBytes, -totalBatchSize);
+                        }
                     }
                     else
                     {
-                        var agg = ArrayPool<byte>.Shared.Rent(total);
-                        var offset = 0;
-                        foreach (var item in batch)
+                        foreach (var memory in buffer)
                         {
-                            item.Buffer.AsSpan(0, item.Length).CopyTo(agg.AsSpan(offset));
-                            offset += item.Length;
+                            await stream.WriteAsync(memory);
                         }
-                        await stream.WriteAsync(agg.AsMemory(0, total));
-                        ArrayPool<byte>.Shared.Return(agg);
+                        Interlocked.Add(ref _pendingBytes, -buffer.Length);
                     }
-
-                    foreach (var item in batch)
-                    {
-                        Interlocked.Add(ref _pendingBytes, -item.Length);
-                        if (item.Pooled) ArrayPool<byte>.Shared.Return(item.Buffer);
-                    }
+                }
+                finally
+                {
+                    reader.AdvanceTo(buffer.End);
                 }
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[CosmoBroker] Flush error ({_remoteEndPoint}): {ex.Message}");
+            if (PerfEnabled) Console.WriteLine($"[CosmoBroker] Flush error ({_remoteEndPoint}): {ex.Message}");
         }
-        finally { batch.Clear(); }
+        finally { await reader.CompleteAsync(); }
     }
 
     private bool IsAllowedPublish(string subject)
@@ -671,7 +716,10 @@ public class BrokerConnection
         if (Account != null && !string.IsNullOrEmpty(Account.SubjectPrefix))
             scopedSubject = $"{Account.SubjectPrefix}.{subject}";
 
-        var sub = new Subscription { Subject = scopedSubject, QueueGroup = queueGroup, IsRemote = isRemote };
+        // Optimization: Pre-calculate the " <sid> " part of the MSG frame
+        byte[] sidPart = Encoding.UTF8.GetBytes(" " + sid + " ");
+
+        var sub = new Subscription { Subject = scopedSubject, QueueGroup = queueGroup, IsRemote = isRemote, CachedSidPart = sidPart };
         _subscriptions[sid] = sub;
         _topicTree.Subscribe(scopedSubject, this, sid, queueGroup);
         if (_server?.UseSublist == true) _server.AddSublist(scopedSubject, this, sid, queueGroup);
@@ -888,12 +936,13 @@ public class BrokerConnection
     {
         if (length <= 0) return;
         Interlocked.Add(ref _pendingBytes, length);
-        _sendQueue.Writer.TryWrite(new OutboundBuffer(buffer, length, pooled));
+        _sendPipe.Writer.Write(buffer.AsSpan(0, length));
+        _ = _sendPipe.Writer.FlushAsync();
+        if (pooled) ArrayPool<byte>.Shared.Return(buffer);
     }
 
-    private OutboundBuffer BuildNatsMessage(string subject, string sid, string? replyTo, bool useHeaders, int headerLen, ReadOnlySpan<byte> totalPayloadLenBytes, ReadOnlySpan<byte> ttlBytes, ReadOnlySequence<byte> payload)
+    private OutboundBuffer BuildNatsMessage(ReadOnlySpan<byte> subject, string sid, string? replyTo, bool useHeaders, int headerLen, ReadOnlySpan<byte> totalPayloadLenBytes, ReadOnlySpan<byte> ttlBytes, ReadOnlySequence<byte> payload)
     {
-        var subjectBytes = GetCachedBytes(subject);
         var sidBytes = GetCachedBytes(sid);
         var replyBytes = !string.IsNullOrEmpty(replyTo) ? GetCachedBytes(replyTo) : null;
         
@@ -903,7 +952,7 @@ public class BrokerConnection
 
         int size = 0;
         size += (useHeaders ? HMsgVerb.Length : MsgVerb.Length);
-        size += subjectBytes.Length + Space.Length;
+        size += subject.Length + Space.Length;
         size += sidBytes.Length + Space.Length;
         if (replyBytes != null) size += replyBytes.Length + Space.Length;
         if (useHeaders) size += hlenLen + Space.Length;
@@ -918,8 +967,8 @@ public class BrokerConnection
         (useHeaders ? HMsgVerb : MsgVerb).CopyTo(span.Slice(offset));
         offset += (useHeaders ? HMsgVerb.Length : MsgVerb.Length);
 
-        subjectBytes.CopyTo(span.Slice(offset));
-        offset += subjectBytes.Length;
+        subject.CopyTo(span.Slice(offset));
+        offset += subject.Length;
         Space.CopyTo(span.Slice(offset));
         offset += Space.Length;
 
@@ -973,38 +1022,30 @@ public class BrokerConnection
         {
             return true;
         }
-        var pending = Interlocked.Read(ref _pendingBytes);
-        if (pending > MaxBufferedBytes)
-        {
-            Interlocked.Increment(ref _droppedMsgs);
-            return false;
-        }
+        
         sub.ReceivedMsgs++;
         MsgOut++;
 
-        string clientSubject = subject;
-        string? clientReplyTo = replyTo;
-
+        // Optimization: Zero-allocation prefix stripping using string span
+        ReadOnlySpan<char> clientSubject = subject;
         if (Account != null && !string.IsNullOrEmpty(Account.SubjectPrefix))
         {
             var prefix = Account.SubjectPrefix;
-            if (subject.Length > prefix.Length && subject.AsSpan().StartsWith(prefix) && subject[prefix.Length] == '.')
+            if (subject.Length > prefix.Length && subject.StartsWith(prefix) && subject[prefix.Length] == '.')
             {
-                clientSubject = subject.Substring(prefix.Length + 1);
-            }
-            if (replyTo != null && replyTo.Length > prefix.Length && replyTo.AsSpan().StartsWith(prefix) && replyTo[prefix.Length] == '.')
-            {
-                clientReplyTo = replyTo.Substring(prefix.Length + 1);
+                clientSubject = subject.AsSpan(prefix.Length + 1);
             }
         }
 
         if (_protocol == ProtocolType.MQTT)
         {
-            var frame = MQTT.MqttParser.FramePublish(clientSubject, payload.IsSingleSegment ? payload.FirstSpan : payload.ToArray());
+            var frame = MQTT.MqttParser.FramePublish(new string(clientSubject), payload.IsSingleSegment ? payload.FirstSpan : payload.ToArray());
             BytesOut += frame.Length;
             Interlocked.Add(ref _bytesOutTotal, frame.Length);
-            EnqueueBuffer(frame, frame.Length, pooled: false);
-            return pending < SoftLimitBytes;
+            Interlocked.Add(ref _pendingBytes, frame.Length);
+            _sendPipe.Writer.Write(frame);
+            _ = _sendPipe.Writer.FlushAsync();
+            return Interlocked.Read(ref _pendingBytes) < SoftLimitBytes;
         }
 
         bool useHeaders = ttl.HasValue && SupportsHeaders;
@@ -1023,7 +1064,10 @@ public class BrokerConnection
 
         if (_protocol == ProtocolType.WebSocket)
         {
-            var outbound = BuildNatsMessage(clientSubject, sid, clientReplyTo, useHeaders, headerLen, totPayloadLenBuf.Slice(0, totPayloadLenLen), ttlBytes.Slice(0, ttlLen), payload);
+            // For WebSocket we still need bytes for BuildNatsMessage, but we can encode directly
+            Span<byte> subjectBuf = stackalloc byte[clientSubject.Length * 3];
+            int subjectByteCount = Encoding.UTF8.GetBytes(clientSubject, subjectBuf);
+            var outbound = BuildNatsMessage(subjectBuf.Slice(0, subjectByteCount), sid, replyTo, useHeaders, headerLen, totPayloadLenBuf.Slice(0, totPayloadLenLen), ttlBytes.Slice(0, ttlLen), payload);
             var frame = WebSockets.WebSocketFramer.FrameMessage(outbound.Buffer.AsSpan(0, outbound.Length));
             BytesOut += frame.Length;
             Interlocked.Add(ref _bytesOutTotal, frame.Length);
@@ -1032,46 +1076,72 @@ public class BrokerConnection
         }
         else
         {
-            // Optimization: Fast path using CachedPrefix
-            if (!useHeaders && string.IsNullOrEmpty(clientReplyTo))
+            // Direct write to PipeWriter to avoid extra copies and rentals
+            var writer = _sendPipe.Writer;
+            
+            // Calculate header size
+            int headerEstimate = 32 + (clientSubject.Length * 3) + (sub.CachedSidPart?.Length ?? 16) + (replyTo?.Length ?? 0) + totPayloadLenLen;
+            var span = writer.GetSpan(headerEstimate);
+            int offset = 0;
+
+            (useHeaders ? HMsgVerb : MsgVerb).CopyTo(span.Slice(offset));
+            offset += (useHeaders ? HMsgVerb.Length : MsgVerb.Length);
+
+            int written = Encoding.UTF8.GetBytes(clientSubject, span.Slice(offset));
+            offset += written;
+
+            if (sub.CachedSidPart != null)
             {
-                var prefix = sub.CachedPrefix;
-                if (prefix == null)
-                {
-                    var subjBytes = Encoding.UTF8.GetBytes(clientSubject);
-                    var sidBytes = Encoding.UTF8.GetBytes(sid);
-                    // "MSG " + subj + " " + sid + " "
-                    int psize = 4 + subjBytes.Length + 1 + sidBytes.Length + 1;
-                    prefix = new byte[psize];
-                    "MSG "u8.CopyTo(prefix);
-                    subjBytes.CopyTo(prefix.AsSpan(4));
-                    prefix[4 + subjBytes.Length] = (byte)' ';
-                    sidBytes.CopyTo(prefix.AsSpan(4 + subjBytes.Length + 1));
-                    prefix[psize - 1] = (byte)' ';
-                    sub.CachedPrefix = prefix;
-                }
-
-                int totalLen = prefix.Length + totPayloadLenLen + 2 + (int)payload.Length + 2;
-                var buffer = ArrayPool<byte>.Shared.Rent(totalLen);
-                var span = buffer.AsSpan();
-                int offset = 0;
-                prefix.CopyTo(span.Slice(offset)); offset += prefix.Length;
-                totPayloadLenBuf.Slice(0, totPayloadLenLen).CopyTo(span.Slice(offset)); offset += totPayloadLenLen;
-                "\r\n"u8.CopyTo(span.Slice(offset)); offset += 2;
-                foreach (var seg in payload) { seg.Span.CopyTo(span.Slice(offset)); offset += seg.Span.Length; }
-                "\r\n"u8.CopyTo(span.Slice(offset)); offset += 2;
-
-                BytesOut += offset;
-                Interlocked.Add(ref _bytesOutTotal, offset);
-                EnqueueBuffer(buffer, offset, pooled: true);
+                sub.CachedSidPart.CopyTo(span.Slice(offset));
+                offset += sub.CachedSidPart.Length;
             }
             else
             {
-                var outbound = BuildNatsMessage(clientSubject, sid, clientReplyTo, useHeaders, headerLen, totPayloadLenBuf.Slice(0, totPayloadLenLen), ttlBytes.Slice(0, ttlLen), payload);
-                BytesOut += outbound.Length;
-                Interlocked.Add(ref _bytesOutTotal, outbound.Length);
-                EnqueueBuffer(outbound.Buffer, outbound.Length, pooled: outbound.Pooled);
+                // Fallback if not cached
+                Space.CopyTo(span.Slice(offset));
+                offset += Space.Length;
+                offset += Encoding.UTF8.GetBytes(sid, span.Slice(offset));
+                Space.CopyTo(span.Slice(offset));
+                offset += Space.Length;
             }
+
+            if (replyTo != null)
+            {
+                offset += Encoding.UTF8.GetBytes(replyTo, span.Slice(offset));
+                Space.CopyTo(span.Slice(offset));
+                offset += Space.Length;
+            }
+            if (useHeaders)
+            {
+                Utf8Formatter.TryFormat(headerLen, span.Slice(offset), out int hlenLenWritten);
+                offset += hlenLenWritten;
+                Space.CopyTo(span.Slice(offset));
+                offset += Space.Length;
+            }
+            totPayloadLenBuf.Slice(0, totPayloadLenLen).CopyTo(span.Slice(offset));
+            offset += totPayloadLenLen;
+            Crlf.CopyTo(span.Slice(offset));
+            offset += Crlf.Length;
+            
+            writer.Advance(offset);
+
+            if (useHeaders)
+            {
+                writer.Write(HeaderMagic);
+                writer.Write(ttlBytes.Slice(0, ttlLen));
+                writer.Write(HeaderEnd);
+            }
+
+            foreach (var seg in payload)
+            {
+                writer.Write(seg.Span);
+            }
+            writer.Write(Crlf);
+
+            int totalWritten = offset + totalPayloadLen + Crlf.Length;
+            BytesOut += totalWritten;
+            Interlocked.Add(ref _bytesOutTotal, totalWritten);
+            Interlocked.Add(ref _pendingBytes, totalWritten);
         }
 
         if (sub.MaxMsgs.HasValue && sub.ReceivedMsgs >= sub.MaxMsgs.Value)
@@ -1082,7 +1152,145 @@ public class BrokerConnection
                 if (!sub.IsRemote) _server?.NotifyUnsubscription(sid);
             }
         }
-        return pending < SoftLimitBytes;
+        
+        return Interlocked.Read(ref _pendingBytes) < SoftLimitBytes;
+    }
+
+    public bool SendMessageWithTTL(ReadOnlySpan<byte> subject, string sid, ReadOnlySequence<byte> payload, string? replyTo, TimeSpan? ttl)
+    {
+        if (!_subscriptions.TryGetValue(sid, out var sub))
+        {
+            return true;
+        }
+        
+        sub.ReceivedMsgs++;
+        MsgOut++;
+
+        // Optimization: Zero-allocation prefix stripping
+        ReadOnlySpan<byte> clientSubject = subject;
+        if (Account != null && !string.IsNullOrEmpty(Account.SubjectPrefix))
+        {
+            var prefix = GetCachedBytes(Account.SubjectPrefix);
+            if (subject.Length > prefix.Length && subject.StartsWith(prefix) && subject[prefix.Length] == '.')
+            {
+                clientSubject = subject.Slice(prefix.Length + 1);
+            }
+        }
+
+        if (_protocol == ProtocolType.MQTT)
+        {
+            var frame = MQTT.MqttParser.FramePublish(Encoding.UTF8.GetString(clientSubject), payload.IsSingleSegment ? payload.FirstSpan : payload.ToArray());
+            BytesOut += frame.Length;
+            Interlocked.Add(ref _bytesOutTotal, frame.Length);
+            Interlocked.Add(ref _pendingBytes, frame.Length);
+            _sendPipe.Writer.Write(frame);
+            _ = _sendPipe.Writer.FlushAsync();
+            return Interlocked.Read(ref _pendingBytes) < SoftLimitBytes;
+        }
+
+        bool useHeaders = ttl.HasValue && SupportsHeaders;
+        int headerLen = 0;
+        Span<byte> ttlBytes = stackalloc byte[16];
+        int ttlLen = 0;
+        if (useHeaders)
+        {
+            Utf8Formatter.TryFormat((int)ttl!.Value.TotalSeconds, ttlBytes, out ttlLen);
+            headerLen = HeaderMagic.Length + ttlLen + HeaderEnd.Length;
+        }
+
+        int totalPayloadLen = (int)payload.Length + headerLen;
+        Span<byte> totPayloadLenBuf = stackalloc byte[16];
+        Utf8Formatter.TryFormat(totalPayloadLen, totPayloadLenBuf, out int totPayloadLenLen);
+
+        if (_protocol == ProtocolType.WebSocket)
+        {
+            var outbound = BuildNatsMessage(clientSubject, sid, replyTo, useHeaders, headerLen, totPayloadLenBuf.Slice(0, totPayloadLenLen), ttlBytes.Slice(0, ttlLen), payload);
+            var frame = WebSockets.WebSocketFramer.FrameMessage(outbound.Buffer.AsSpan(0, outbound.Length));
+            BytesOut += frame.Length;
+            Interlocked.Add(ref _bytesOutTotal, frame.Length);
+            EnqueueBuffer(frame, frame.Length, pooled: false);
+            if (outbound.Pooled) ArrayPool<byte>.Shared.Return(outbound.Buffer);
+        }
+        else
+        {
+            // Direct write to PipeWriter to avoid extra copies and rentals
+            var writer = _sendPipe.Writer;
+            
+            // Calculate header size
+            int headerEstimate = 32 + clientSubject.Length + (sub.CachedSidPart?.Length ?? 16) + (replyTo?.Length ?? 0) + totPayloadLenLen;
+            var span = writer.GetSpan(headerEstimate);
+            int offset = 0;
+
+            (useHeaders ? HMsgVerb : MsgVerb).CopyTo(span.Slice(offset));
+            offset += (useHeaders ? HMsgVerb.Length : MsgVerb.Length);
+
+            clientSubject.CopyTo(span.Slice(offset));
+            offset += clientSubject.Length;
+
+            if (sub.CachedSidPart != null)
+            {
+                sub.CachedSidPart.CopyTo(span.Slice(offset));
+                offset += sub.CachedSidPart.Length;
+            }
+            else
+            {
+                // Fallback if not cached
+                Space.CopyTo(span.Slice(offset));
+                offset += Space.Length;
+                offset += Encoding.UTF8.GetBytes(sid, span.Slice(offset));
+                Space.CopyTo(span.Slice(offset));
+                offset += Space.Length;
+            }
+
+            if (replyTo != null)
+            {
+                offset += Encoding.UTF8.GetBytes(replyTo, span.Slice(offset));
+                Space.CopyTo(span.Slice(offset));
+                offset += Space.Length;
+            }
+            if (useHeaders)
+            {
+                Utf8Formatter.TryFormat(headerLen, span.Slice(offset), out int hlenLenWritten);
+                offset += hlenLenWritten;
+                Space.CopyTo(span.Slice(offset));
+                offset += Space.Length;
+            }
+            totPayloadLenBuf.Slice(0, totPayloadLenLen).CopyTo(span.Slice(offset));
+            offset += totPayloadLenLen;
+            Crlf.CopyTo(span.Slice(offset));
+            offset += Crlf.Length;
+            
+            writer.Advance(offset);
+
+            if (useHeaders)
+            {
+                writer.Write(HeaderMagic);
+                writer.Write(ttlBytes.Slice(0, ttlLen));
+                writer.Write(HeaderEnd);
+            }
+
+            foreach (var seg in payload)
+            {
+                writer.Write(seg.Span);
+            }
+            writer.Write(Crlf);
+
+            int totalWritten = offset + totalPayloadLen + Crlf.Length;
+            BytesOut += totalWritten;
+            Interlocked.Add(ref _bytesOutTotal, totalWritten);
+            Interlocked.Add(ref _pendingBytes, totalWritten);
+        }
+
+        if (sub.MaxMsgs.HasValue && sub.ReceivedMsgs >= sub.MaxMsgs.Value)
+        {
+            if (_subscriptions.TryRemove(sid, out _))
+            {
+                _topicTree.Unsubscribe(sub.Subject, this, sid, sub.QueueGroup);
+                if (!sub.IsRemote) _server?.NotifyUnsubscription(sid);
+            }
+        }
+        
+        return Interlocked.Read(ref _pendingBytes) < SoftLimitBytes;
     }
 
     private void SendError(string message)
@@ -1127,7 +1335,7 @@ public class BrokerConnection
     {
         foreach (var sub in _subscriptions) _topicTree.Unsubscribe(sub.Value.Subject, this, sub.Key, sub.Value.QueueGroup);
         _subscriptions.Clear();
-        _sendQueue.Writer.TryComplete();
+        _sendPipe.Writer.Complete();
         try { _stream.Close(); } catch { }
     }
 
@@ -1215,7 +1423,6 @@ public class BrokerConnection
     {
         private const int Capacity = 1024;
         private readonly Entry[] _entries = new Entry[Capacity];
-        private int _next;
 
         private struct Entry
         {
@@ -1223,27 +1430,28 @@ public class BrokerConnection
             public byte[]? Bytes;
             public Sublist.SublistResult? Result;
             public string? SubjectStr;
+            public long Version;
         }
 
-        public (Sublist.SublistResult? Result, string? SubjectStr) Get(ReadOnlySpan<byte> bytes)
+        public (Sublist.SublistResult? Result, string? SubjectStr) Get(ReadOnlySpan<byte> bytes, long version)
         {
             int hash = Hash(bytes);
             int idx = hash & (Capacity - 1);
             var e = _entries[idx];
-            if (e.Bytes != null && e.Hash == hash && bytes.SequenceEqual(e.Bytes))
+            if (e.Bytes != null && e.Hash == hash && e.Version == version && bytes.SequenceEqual(e.Bytes))
             {
                 return (e.Result, e.SubjectStr);
             }
             return (null, null);
         }
 
-        public void Set(ReadOnlySpan<byte> bytes, Sublist.SublistResult result, string subjectStr)
+        public void Set(ReadOnlySpan<byte> bytes, Sublist.SublistResult result, string subjectStr, long version)
         {
             int hash = Hash(bytes);
             int idx = hash & (Capacity - 1);
             var copy = new byte[bytes.Length];
             bytes.CopyTo(copy);
-            _entries[idx] = new Entry { Hash = hash, Bytes = copy, Result = result, SubjectStr = subjectStr };
+            _entries[idx] = new Entry { Hash = hash, Bytes = copy, Result = result, SubjectStr = subjectStr, Version = version };
         }
 
         private static int Hash(ReadOnlySpan<byte> bytes)

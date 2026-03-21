@@ -6,20 +6,6 @@ using System.Threading;
 
 namespace CosmoBroker;
 
-public class ReadOnlySpanByteComparer : IEqualityComparer<byte[]>, IAlternateEqualityComparer<ReadOnlySpan<byte>, byte[]>
-{
-    public bool Equals(byte[]? x, byte[]? y) => (x == null && y == null) || (x != null && y != null && x.AsSpan().SequenceEqual(y));
-    public int GetHashCode(byte[] obj) => GetHashCode(obj.AsSpan());
-    public byte[] Create(ReadOnlySpan<byte> alternate) => alternate.ToArray();
-    public bool Equals(ReadOnlySpan<byte> alternate, byte[] other) => alternate.SequenceEqual(other);
-    public int GetHashCode(ReadOnlySpan<byte> alternate)
-    {
-        var hash = new HashCode();
-        hash.AddBytes(alternate);
-        return hash.ToHashCode();
-    }
-}
-
 public class TopicTree
 {
     private class TopicNode : IDisposable
@@ -34,7 +20,7 @@ public class TopicTree
         public ConcurrentDictionary<string, int> QueueGroupCursors { get; } = new();
 
         // Child nodes (e.g., "foo" -> "bar" for "foo.bar")
-        public Dictionary<byte[], TopicNode> Children { get; } = new(new ReadOnlySpanByteComparer());
+        public Dictionary<byte[], TopicNode> Children { get; } = new(new Sublist.ReadOnlySpanByteComparer());
         public ReaderWriterLockSlim ChildrenLock { get; } = new();
 
         public void Dispose()
@@ -145,142 +131,173 @@ public class TopicTree
         finally { node.ChildrenLock.ExitReadLock(); }
     }
 
-    public void Publish(string subject, System.Buffers.ReadOnlySequence<byte> payload, string? replyTo = null, BrokerConnection? source = null)
+    public bool Publish(string subject, System.Buffers.ReadOnlySequence<byte> payload, string? replyTo = null, BrokerConnection? source = null)
     {
-        PublishWithTTL(subject, payload, replyTo, null, source);
+        return PublishWithTTL(subject, payload, replyTo, null, source);
     }
 
-    public void PublishWithTTL(string subject, System.Buffers.ReadOnlySequence<byte> payload, string? replyTo = null, TimeSpan? ttl = null, BrokerConnection? source = null)
+    public bool PublishWithTTL(string subject, System.Buffers.ReadOnlySequence<byte> payload, string? replyTo = null, TimeSpan? ttl = null, BrokerConnection? source = null)
     {
         // Fallback for string-based calls
         Span<byte> subjectBytes = stackalloc byte[subject.Length * 3]; // UTF8 worst case
         int len = System.Text.Encoding.UTF8.GetBytes(subject, subjectBytes);
-        MatchAndPublish(_root, subjectBytes.Slice(0, len), subject, payload, replyTo, ttl, source);
+        var subSpan = subjectBytes.Slice(0, len);
+        return MatchAndPublish(_root, subSpan, subSpan, subject, payload, replyTo, ttl, source);
     }
 
-    public void Publish(ReadOnlySpan<byte> subject, System.Buffers.ReadOnlySequence<byte> payload, string? replyTo = null, BrokerConnection? source = null)
+    public bool PublishWithTTL(ReadOnlySpan<byte> subject, System.Buffers.ReadOnlySequence<byte> payload, string? replyTo = null, TimeSpan? ttl = null, BrokerConnection? source = null)
     {
-        // Primary zero-allocation path
-        MatchAndPublish(_root, subject, null, payload, replyTo, ttl: null, source);
+        // Primary zero-allocation path - pass full subject span for correct delivery
+        return MatchAndPublish(_root, subject, subject, null, payload, replyTo, ttl, source);
     }
 
-    private void MatchAndPublish(TopicNode node, ReadOnlySpan<byte> remaining, string? originalSubject, System.Buffers.ReadOnlySequence<byte> payload, string? replyTo = null, TimeSpan? ttl = null, BrokerConnection? source = null)
+    private bool MatchAndPublish(TopicNode node, ReadOnlySpan<byte> fullSubject, ReadOnlySpan<byte> remaining, string? originalSubject, System.Buffers.ReadOnlySequence<byte> payload, string? replyTo = null, TimeSpan? ttl = null, BrokerConnection? source = null)
     {
+        bool accepted = true;
         var lookup = node.Children.GetAlternateLookup<ReadOnlySpan<byte>>();
         node.ChildrenLock.EnterReadLock();
         try
         {
             if (lookup.TryGetValue(WildcardChevron, out var chevronNode))
             {
-                DeliverToNode(chevronNode, originalSubject, remaining, payload, replyTo, ttl, source);
+                if (!DeliverToNode(chevronNode, originalSubject, fullSubject, payload, replyTo, ttl, source))
+                    accepted = false;
             }
 
             int dotIdx = remaining.IndexOf((byte)'.');
             if (dotIdx == -1)
             {
                 if (lookup.TryGetValue(remaining, out var literalNode))
-                    DeliverToNode(literalNode, originalSubject, remaining, payload, replyTo, ttl, source);
+                {
+                    if (!DeliverToNode(literalNode, originalSubject, fullSubject, payload, replyTo, ttl, source))
+                        accepted = false;
+                }
                 if (lookup.TryGetValue(WildcardStar, out var starNode))
-                    DeliverToNode(starNode, originalSubject, remaining, payload, replyTo, ttl, source);
-                return;
+                {
+                    if (!DeliverToNode(starNode, originalSubject, fullSubject, payload, replyTo, ttl, source))
+                        accepted = false;
+                }
+                return accepted;
             }
 
             var part = remaining.Slice(0, dotIdx);
             var nextRemaining = remaining.Slice(dotIdx + 1);
 
             if (lookup.TryGetValue(part, out var nextLiteral))
-                MatchAndPublish(nextLiteral, nextRemaining, originalSubject, payload, replyTo, ttl, source);
+            {
+                if (!MatchAndPublish(nextLiteral, fullSubject, nextRemaining, originalSubject, payload, replyTo, ttl, source))
+                    accepted = false;
+            }
 
             if (lookup.TryGetValue(WildcardStar, out var nextStar))
-                MatchAndPublish(nextStar, nextRemaining, originalSubject, payload, replyTo, ttl, source);
+            {
+                if (!MatchAndPublish(nextStar, fullSubject, nextRemaining, originalSubject, payload, replyTo, ttl, source))
+                    accepted = false;
+            }
         }
         finally { node.ChildrenLock.ExitReadLock(); }
+        return accepted;
     }
 
-    private void DeliverToNode(TopicNode node, string? originalSubject, ReadOnlySpan<byte> remaining, System.Buffers.ReadOnlySequence<byte> payload, string? replyTo, TimeSpan? ttl, BrokerConnection? source)
+    private bool DeliverToNode(TopicNode node, string? originalSubject, ReadOnlySpan<byte> fullSubject, System.Buffers.ReadOnlySequence<byte> payload, string? replyTo, TimeSpan? ttl, BrokerConnection? source)
     {
+        bool accepted = true;
         string? resolvedSubject = originalSubject;
 
-        foreach (var sub in node.Subscribers)
+        if (node.Subscribers.Count > 0)
         {
-            foreach (var conn in sub.Value.Keys)
+            foreach (var sub in node.Subscribers)
             {
-                if (conn == source && source?.NoEcho == true) continue;
-                if (source != null && (source.IsRoute || source.IsLeaf) && (conn.IsRoute || conn.IsLeaf)) continue;
-                
-                if (resolvedSubject == null) resolvedSubject = System.Text.Encoding.UTF8.GetString(remaining);
-                conn.SendMessageWithTTL(resolvedSubject, sub.Key, payload, replyTo, ttl);
+                foreach (var conn in sub.Value.Keys)
+                {
+                    if (conn == source && source?.NoEcho == true) continue;
+                    if (source != null && (source.IsRoute || source.IsLeaf) && (conn.IsRoute || conn.IsLeaf)) continue;
+                    
+                    bool res;
+                    if (resolvedSubject != null)
+                        res = conn.SendMessageWithTTL(resolvedSubject, sub.Key, payload, replyTo, ttl);
+                    else
+                        res = conn.SendMessageWithTTL(fullSubject, sub.Key, payload, replyTo, ttl);
+                    
+                    if (!res) accepted = false;
+                }
             }
         }
 
-        foreach (var groupEntry in node.QueueGroups)
+        if (node.QueueGroups.Count > 0)
         {
-            var group = groupEntry.Value;
-            if (group.IsEmpty) continue;
-
-            int total = 0;
-            foreach (var sidEntry in group) total += sidEntry.Value.Count;
-            if (total == 0) continue;
-
-            var entries = System.Buffers.ArrayPool<(string Sid, BrokerConnection Conn)>.Shared.Rent(total);
-            try
+            foreach (var groupEntry in node.QueueGroups)
             {
-                int count = 0;
+                var group = groupEntry.Value;
+                if (group.IsEmpty) continue;
+
+                // Round-robin selection without renting arrays
+                int totalCount = 0;
+                foreach (var sidEntry in group) totalCount += sidEntry.Value.Count;
+                if (totalCount == 0) continue;
+
+                int cursor = node.QueueGroupCursors.AddOrUpdate(groupEntry.Key, 0, (k, v) => (v + 1) % 1000000);
+                int target = cursor % totalCount;
+
+                (string Sid, BrokerConnection Conn) selected = default;
+                bool found = false;
+                int current = 0;
+
                 foreach (var sidEntry in group)
                 {
                     foreach (var conn in sidEntry.Value.Keys)
                     {
-                        entries[count++] = (sidEntry.Key, conn);
-                    }
-                }
-
-                if (count == 0) continue;
-
-                int start = node.QueueGroupCursors.AddOrUpdate(
-                    groupEntry.Key,
-                    _ => 0,
-                    (_, v) => (v + 1) % count);
-
-                (string Sid, BrokerConnection Conn)? selected = null;
-                bool sourcePresent = false;
-
-                for (int i = 0; i < count; i++)
-                {
-                    var entry = entries[(start + i) % count];
-                    if (entry.Conn == source)
-                    {
-                        sourcePresent = true;
-                        if (source?.NoEcho == true) continue;
-                    }
-                    if (source != null && (source.IsRoute || source.IsLeaf) && (entry.Conn.IsRoute || entry.Conn.IsLeaf)) continue;
-                    selected = entry;
-                    break;
-                }
-
-                if (selected == null && sourcePresent && source?.NoEcho != true)
-                {
-                    for (int i = 0; i < count; i++)
-                    {
-                        if (entries[i].Conn == source)
+                        if (current == target)
                         {
-                            selected = entries[i];
+                            // Validate constraints
+                            if ((conn == source && source?.NoEcho == true) ||
+                                (source != null && (source.IsRoute || source.IsLeaf) && (conn.IsRoute || conn.IsLeaf)))
+                            {
+                                // If skipped, just take the next available one in the same pass or fallback
+                                target = (target + 1) % totalCount;
+                            }
+                            else
+                            {
+                                selected = (sidEntry.Key, conn);
+                                found = true;
+                                break;
+                            }
+                        }
+                        current++;
+                    }
+                    if (found) break;
+                }
+
+                // Simple fallback if the specific target was excluded
+                if (!found)
+                {
+                    foreach (var sidEntry in group)
+                    {
+                        foreach (var conn in sidEntry.Value.Keys)
+                        {
+                            if (conn == source && source?.NoEcho == true) continue;
+                            if (source != null && (source.IsRoute || source.IsLeaf) && (conn.IsRoute || conn.IsLeaf)) continue;
+                            selected = (sidEntry.Key, conn);
+                            found = true;
                             break;
                         }
+                        if (found) break;
                     }
                 }
 
-                if (selected != null)
+                if (found)
                 {
-                    if (resolvedSubject == null) resolvedSubject = System.Text.Encoding.UTF8.GetString(remaining);
-                    var pick = selected.Value;
-                    pick.Conn.SendMessageWithTTL(resolvedSubject, pick.Sid, payload, replyTo, ttl);
+                    bool res;
+                    if (resolvedSubject != null)
+                        res = selected.Conn.SendMessageWithTTL(resolvedSubject, selected.Sid!, payload, replyTo, ttl);
+                    else
+                        res = selected.Conn.SendMessageWithTTL(fullSubject, selected.Sid!, payload, replyTo, ttl);
+                    
+                    if (!res) accepted = false;
                 }
             }
-            finally
-            {
-                System.Buffers.ArrayPool<(string Sid, BrokerConnection Conn)>.Shared.Return(entries);
-            }
         }
+        return accepted;
     }
 
     public bool HasSubscribers(string subject)
