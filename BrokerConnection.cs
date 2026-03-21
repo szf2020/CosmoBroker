@@ -664,9 +664,9 @@ public class BrokerConnection
                         {
                             await stream.WriteAsync(memory);
                         }
+                        await stream.FlushAsync();
                         Interlocked.Add(ref _pendingBytes, -buffer.Length);
-                    }
-                }
+                        }                }
                 finally
                 {
                     reader.AdvanceTo(buffer.End);
