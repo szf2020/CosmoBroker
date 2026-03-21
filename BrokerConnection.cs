@@ -90,7 +90,6 @@ public class BrokerConnection
     // Optimization: Per-connection byte cache for strings to avoid re-encoding
     private readonly ConcurrentDictionary<string, byte[]> _stringByteCache = new();
     private static readonly ThreadLocal<L1MatchCache> MatchCache = new(() => new L1MatchCache());
-    private static readonly ThreadLocal<HashSet<BrokerConnection>> TouchedConnections = new(() => new HashSet<BrokerConnection>());
 
     public object GetStats() => new {
         protocol = _protocol.ToString(),
@@ -244,7 +243,7 @@ public class BrokerConnection
         finally { await writer.CompleteAsync(); }
     }
 
-    private bool ProcessPubPayload(ref ReadOnlySequence<byte> buffer, SequencePosition linePosition, ReadOnlySpan<byte> subject, ReadOnlySpan<byte> replyTo, int totalLength, int headerLen, bool isHPub, HashSet<BrokerConnection> touched, out bool accepted)
+    private bool ProcessPubPayload(ref ReadOnlySequence<byte> buffer, SequencePosition linePosition, ReadOnlySpan<byte> subject, ReadOnlySpan<byte> replyTo, int totalLength, int headerLen, bool isHPub, out bool accepted)
     {
         var pubStart = PerfEnabled ? Stopwatch.GetTimestamp() : 0L;
         var payloadStart = buffer.GetPosition(1, linePosition);
@@ -303,8 +302,6 @@ public class BrokerConnection
                             if ((IsRoute || IsLeaf) && (sub.Conn.IsRoute || sub.Conn.IsLeaf)) continue;
                             if (!sub.Conn.SendMessageWithTTL(subject, sub.Sid, fullPayload, replyToStr, null))
                                 accepted = false;
-                            
-                            touched.Add(sub.Conn);
                         }
                     }
 
@@ -325,7 +322,6 @@ public class BrokerConnection
 
                                 if (sub.Conn.SendMessageWithTTL(subject, sub.Sid, fullPayload, replyToStr, null))
                                 {
-                                    touched.Add(sub.Conn);
                                     break;
                                 }
                                 else accepted = false;
@@ -367,14 +363,12 @@ public class BrokerConnection
 
     private async Task ProcessPipeAsync(PipeReader reader)
     {
-        var touched = TouchedConnections.Value!;
         try
         {
             while (true)
             {
                 var result = await reader.ReadAsync();
                 var buffer = result.Buffer;
-                touched.Clear();
 
                 while (true)
                 {
@@ -465,7 +459,7 @@ public class BrokerConnection
                                         var replyTo = rest.Slice(0, space3);
                                         if (Utf8Parser.TryParse(rest.Slice(space3 + 1), out totalLength, out _))
                                         {
-                                            if (ProcessPubPayload(ref buffer, linePosition.Value, subject, replyTo, totalLength, 0, false, touched, out bool acc)) 
+                                            if (ProcessPubPayload(ref buffer, linePosition.Value, subject, replyTo, totalLength, 0, false, out bool acc)) 
                                             {
                                                 if (!acc) await Task.Yield();
                                                 continue; 
@@ -475,7 +469,7 @@ public class BrokerConnection
                                     }
                                     else if (Utf8Parser.TryParse(rest, out totalLength, out _))
                                     {
-                                        if (ProcessPubPayload(ref buffer, linePosition.Value, subject, default, totalLength, 0, false, touched, out bool acc))
+                                        if (ProcessPubPayload(ref buffer, linePosition.Value, subject, default, totalLength, 0, false, out bool acc))
                                         {
                                             if (!acc) await Task.Yield();
                                             continue;
@@ -511,7 +505,7 @@ public class BrokerConnection
                                             if (Utf8Parser.TryParse(nextPart.Slice(0, space4), out int headerLen, out _) && 
                                                 Utf8Parser.TryParse(nextPart.Slice(space4 + 1), out int totalLen, out _))
                                             {
-                                                if (ProcessPubPayload(ref buffer, linePosition.Value, subject, replyTo, totalLen, headerLen, true, touched, out bool acc))
+                                                if (ProcessPubPayload(ref buffer, linePosition.Value, subject, replyTo, totalLen, headerLen, true, out bool acc))
                                                 {
                                                     if (!acc) await Task.Yield();
                                                     continue;
@@ -525,7 +519,7 @@ public class BrokerConnection
                                             if (Utf8Parser.TryParse(rest.Slice(0, space3), out int headerLen, out _) && 
                                                 Utf8Parser.TryParse(rest.Slice(space3 + 1), out int totalLen, out _))
                                             {
-                                                if (ProcessPubPayload(ref buffer, linePosition.Value, subject, default, totalLen, headerLen, true, touched, out bool acc))
+                                                if (ProcessPubPayload(ref buffer, linePosition.Value, subject, default, totalLen, headerLen, true, out bool acc))
                                                 {
                                                     if (!acc) await Task.Yield();
                                                     continue;
@@ -543,8 +537,6 @@ public class BrokerConnection
                     buffer = buffer.Slice(buffer.GetPosition(1, linePosition.Value));
                 }
 
-                // Global Batch Flush for this cycle
-                foreach (var conn in touched) _ = conn._sendPipe.Writer.FlushAsync();
                 _ = _sendPipe.Writer.FlushAsync();
 
                 reader.AdvanceTo(buffer.Start, buffer.End);
@@ -1142,6 +1134,7 @@ public class BrokerConnection
             BytesOut += totalWritten;
             Interlocked.Add(ref _bytesOutTotal, totalWritten);
             Interlocked.Add(ref _pendingBytes, totalWritten);
+            _ = writer.FlushAsync();
         }
 
         if (sub.MaxMsgs.HasValue && sub.ReceivedMsgs >= sub.MaxMsgs.Value)
@@ -1279,6 +1272,7 @@ public class BrokerConnection
             BytesOut += totalWritten;
             Interlocked.Add(ref _bytesOutTotal, totalWritten);
             Interlocked.Add(ref _pendingBytes, totalWritten);
+            _ = writer.FlushAsync();
         }
 
         if (sub.MaxMsgs.HasValue && sub.ReceivedMsgs >= sub.MaxMsgs.Value)

@@ -239,7 +239,7 @@ public class TopicTree
                 int cursor = node.QueueGroupCursors.AddOrUpdate(groupEntry.Key, 0, (k, v) => (v + 1) % 1000000);
                 int target = cursor % totalCount;
 
-                (string Sid, BrokerConnection Conn) selected = default;
+                (string Sid, BrokerConnection Conn)? selected = null;
                 bool found = false;
                 int current = 0;
 
@@ -285,13 +285,14 @@ public class TopicTree
                     }
                 }
 
-                if (found)
+                if (selected != null)
                 {
                     bool res;
+                    var pick = selected.Value;
                     if (resolvedSubject != null)
-                        res = selected.Conn.SendMessageWithTTL(resolvedSubject, selected.Sid!, payload, replyTo, ttl);
+                        res = pick.Conn.SendMessageWithTTL(resolvedSubject, pick.Sid, payload, replyTo, ttl);
                     else
-                        res = selected.Conn.SendMessageWithTTL(fullSubject, selected.Sid!, payload, replyTo, ttl);
+                        res = pick.Conn.SendMessageWithTTL(fullSubject, pick.Sid, payload, replyTo, ttl);
                     
                     if (!res) accepted = false;
                 }
