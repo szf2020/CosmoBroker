@@ -93,7 +93,7 @@ public class LeafnodeManager
                 Console.WriteLine($"[Leafnode] Connected to hub {hub}");
 
                 // Start connection loop before sending commands
-                _ = Task.Run(async () => await connection.RunAsync(), ct);
+                var connectionTask = Task.Run(async () => await connection.RunAsync(), ct);
 
                 if (options.ConnectOptions != null)
                 {
@@ -110,6 +110,9 @@ public class LeafnodeManager
 
                 // Bridge local subscriptions to the hub
                 await SyncLocalSubsToHub(connection);
+
+                // Wait for the connection to end before retrying
+                await connectionTask;
             }
             catch (Exception ex)
             {
