@@ -11,3 +11,6 @@
 /Users/kutty/dev/CosmoBroker/obj/Release/net10.0/refint/CosmoBroker.dll
 /Users/kutty/dev/CosmoBroker/obj/Release/net10.0/CosmoBroker.pdb
 /Users/kutty/dev/CosmoBroker/obj/Release/net10.0/ref/CosmoBroker.dll
+/tmp/cb_server_build/CosmoBroker.deps.json
+/tmp/cb_server_build/CosmoBroker.dll
+/tmp/cb_server_build/CosmoBroker.pdb

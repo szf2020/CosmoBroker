@@ -5,7 +5,7 @@
   },
   "projects": {
     "/Users/kutty/dev/CosmoBroker/CosmoBroker.csproj": {
-      "version": "1.0.1",
+      "version": "1.1.0",
       "restore": {
         "projectUniqueName": "/Users/kutty/dev/CosmoBroker/CosmoBroker.csproj",
         "projectName": "CosmoBroker",
@@ -51,11 +51,23 @@
             },
             "CosmoSQLClient.Core": {
               "target": "Package",
-              "version": "[1.9.21, )"
+              "version": "[1.9.30, )"
+            },
+            "CosmoSQLClient.MsSql": {
+              "target": "Package",
+              "version": "[1.9.30, )"
+            },
+            "CosmoSQLClient.Postgres": {
+              "target": "Package",
+              "version": "[1.9.30, )"
             },
             "CosmoSQLClient.Sqlite": {
               "target": "Package",
-              "version": "[1.9.21, )"
+              "version": "[1.9.30, )"
+            },
+            "NATS.NKeys": {
+              "target": "Package",
+              "version": "[1.0.0, )"
             }
           },
           "imports": [

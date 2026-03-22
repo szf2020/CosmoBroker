@@ -227,3 +227,5 @@ CosmoBroker is fully compatible with the official NATS ecosystem:
 | `JetStreamService` | Manages durable streams, acks, and consumer state. |
 | `ClusterManager` | Handles server-to-server mesh state sync. |
 | `MonitoringService` | Exposes the HTTP management and stats API. |
+
+docker buildx build --platform=linux/amd64 --tag vkuttyp/cosmobroker-server:latest -f CosmoBroker.Server/Dockerfile --push .
