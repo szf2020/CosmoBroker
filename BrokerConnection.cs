@@ -85,7 +85,7 @@ public class BrokerConnection
             : 1024L * 1024 * 1024; // 1GB default headroom
     private static readonly long SoftLimitBytes = (MaxBufferedBytes * 7) / 8; // 87.5% limit
     private const int SendBatchBytes = 128 * 1024; // 128KB batching
-    private const int SendBatchMaxItems = 128;
+
 
     // Optimization: Per-connection byte cache for strings to avoid re-encoding
     private readonly ConcurrentDictionary<string, byte[]> _stringByteCache = new();
@@ -640,8 +640,7 @@ public class BrokerConnection
     private async Task SendLoopAsync(Stream stream, PipeReader reader)
     {
         var socket = (stream as NetworkStream)?.Socket;
-        var batch = new List<ArraySegment<byte>>(SendBatchMaxItems);
-        
+
         try
         {
             while (true)
@@ -654,22 +653,13 @@ public class BrokerConnection
                 {
                     if (socket != null && buffer.Length > 1024)
                     {
-                        // Gathering I/O for high-volume batches
-                        batch.Clear();
-                        long totalBatchSize = 0;
+                        // Per-segment send using ReadOnlyMemory overload, which guarantees
+                        // all bytes are delivered (no partial-write data loss).
                         foreach (var memory in buffer)
                         {
-                            if (System.Runtime.InteropServices.MemoryMarshal.TryGetArray(memory, out var segment))
-                            {
-                                batch.Add(segment);
-                                totalBatchSize += segment.Count;
-                            }
+                            await socket.SendAsync(memory, SocketFlags.None);
                         }
-                        if (batch.Count > 0)
-                        {
-                            await socket.SendAsync(batch, SocketFlags.None);
-                            Interlocked.Add(ref _pendingBytes, -totalBatchSize);
-                        }
+                        Interlocked.Add(ref _pendingBytes, -(long)buffer.Length);
                     }
                     else
                     {
@@ -678,8 +668,9 @@ public class BrokerConnection
                             await stream.WriteAsync(memory);
                         }
                         await stream.FlushAsync();
-                        Interlocked.Add(ref _pendingBytes, -buffer.Length);
-                        }                }
+                        Interlocked.Add(ref _pendingBytes, -(long)buffer.Length);
+                    }
+                }
                 finally
                 {
                     reader.AdvanceTo(buffer.End);

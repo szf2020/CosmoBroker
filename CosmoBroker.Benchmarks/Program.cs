@@ -36,6 +36,10 @@ class Program
         Console.WriteLine("--- Throughput + Tail Drop (PUB/SUB) ---");
         var received = 0L;
         using var subCts = new CancellationTokenSource();
+
+        // NATS.Client.Core v2 registers SUB lazily on first MoveNextAsync(), which
+        // runs inside Task.Run. We wait 100ms to ensure the subscription reaches the
+        // broker before publishing starts (negligible vs the 30s receive timeout).
         var subTask = Task.Run(async () =>
         {
             try
@@ -51,6 +55,8 @@ class Program
             {
             }
         });
+
+        await Task.Delay(100); // Let the subscription register on the broker
 
         var payload = new byte[options.PayloadBytes];
         Random.Shared.NextBytes(payload);
