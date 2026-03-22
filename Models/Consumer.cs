@@ -70,11 +70,16 @@ namespace CosmoBroker.JetStream.Models
         // Value is (Count, ReplyTo)
         public ConcurrentQueue<(int Count, string ReplyTo)> PendingPullRequests { get; } = new();
 
+        // Pre-parsed FilterSubject tokens for zero-alloc matching.
+        // null means ">" (match everything).
+        public readonly string[]? FilterTokens;
+
         public Consumer(string name, string streamName, ConsumerConfig config)
         {
             Name = name;
             StreamName = streamName;
             Config = config;
+            FilterTokens = config.FilterSubject == ">" ? null : config.FilterSubject.Split('.');
         }
 
         public bool IsPull => string.IsNullOrEmpty(Config.DeliverSubject);

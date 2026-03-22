@@ -69,9 +69,16 @@ namespace CosmoBroker.JetStream.Models
 
         public string Name => Config.Name;
 
+        // Pre-parsed tokens for each subject pattern in Config.Subjects.
+        // A null entry means ">" (catch-all).
+        public readonly string[]?[] SubjectTokens;
+
         public JetStreamEntity(StreamConfig config)
         {
             Config = config;
+            SubjectTokens = config.Subjects
+                .Select(s => s == ">" ? null : s.Split('.'))
+                .ToArray();
         }
 
         public void LoadMessages(IEnumerable<StreamMessage> messages)

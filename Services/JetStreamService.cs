@@ -113,7 +113,7 @@ namespace CosmoBroker.Services
         {
             foreach (var consumer in stream.Consumers)
             {
-                if (SubjectMatchesAny(consumer.Config.FilterSubject, msg.Subject))
+                if (SubjectMatchesTokens(consumer.FilterTokens, msg.Subject))
                 {
                     if (consumer.IsPull)
                     {
@@ -161,7 +161,7 @@ namespace CosmoBroker.Services
             while (consumer.PendingPullRequests.TryPeek(out var req))
             {
                 var missed = stream.Messages
-                    .Where(m => m.Sequence > consumer.LastDeliveredSeq && SubjectMatchesAny(consumer.Config.FilterSubject, m.Subject))
+                    .Where(m => m.Sequence > consumer.LastDeliveredSeq && SubjectMatchesTokens(consumer.FilterTokens, m.Subject))
                     .Take(req.Count)
                     .ToList();
 
@@ -202,7 +202,7 @@ namespace CosmoBroker.Services
         private void ReplayMissedMessages(Consumer consumer, JetStreamEntity stream)
         {
             var missed = stream.Messages
-                .Where(m => m.Sequence > consumer.LastDeliveredSeq && SubjectMatchesAny(consumer.Config.FilterSubject, m.Subject));
+                .Where(m => m.Sequence > consumer.LastDeliveredSeq && SubjectMatchesTokens(consumer.FilterTokens, m.Subject));
 
             foreach (var msg in missed)
             {
@@ -220,25 +220,30 @@ namespace CosmoBroker.Services
             ProcessPullRequests(consumer, stream);
         }
 
-        private bool SubjectMatchesAny(string pattern, string subject)
+        // Zero-allocation subject matcher. patternTokens == null means ">" (match all).
+        private static bool SubjectMatchesTokens(string[]? patternTokens, string subject)
         {
-            return SubjectMatches(pattern, subject);
-        }
+            if (patternTokens == null) return true;
 
-        private bool SubjectMatches(string pattern, string subject)
-        {
-            if (pattern == ">") return true;
-            var pTokens = pattern.Split('.');
-            var sTokens = subject.Split('.');
+            var span = subject.AsSpan();
+            int tokenIdx = 0;
 
-            for (int i = 0; i < pTokens.Length; i++)
+            while (span.Length > 0)
             {
-                if (i >= sTokens.Length) return false;
-                if (pTokens[i] == ">") return true;
-                if (pTokens[i] == "*") continue;
-                if (pTokens[i] != sTokens[i]) return false;
+                if (tokenIdx >= patternTokens.Length) return false;
+
+                var pTok = patternTokens[tokenIdx].AsSpan();
+                int dotIdx = span.IndexOf('.');
+                var sTok = dotIdx == -1 ? span : span.Slice(0, dotIdx);
+
+                if (pTok.Length == 1 && pTok[0] == '>') return true;
+                if (!(pTok.Length == 1 && pTok[0] == '*') && !pTok.SequenceEqual(sTok)) return false;
+
+                tokenIdx++;
+                span = dotIdx == -1 ? ReadOnlySpan<char>.Empty : span.Slice(dotIdx + 1);
             }
-            return pTokens.Length == sTokens.Length;
+
+            return tokenIdx == patternTokens.Length;
         }
 
         public void Ack(string streamName, string consumerName, long sequence)
@@ -445,7 +450,11 @@ namespace CosmoBroker.Services
         public IEnumerable<string> GetMatchingStreams(string subject)
         {
             return _streams.Values
-                .Where(s => s.Config.Subjects.Any(p => SubjectMatches(p, subject)))
+                .Where(s => {
+                    foreach (var tokens in s.SubjectTokens)
+                        if (SubjectMatchesTokens(tokens, subject)) return true;
+                    return false;
+                })
                 .Select(s => s.Name);
         }
 
