@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800" viewBox="0 0 1200 800">
+<rect width="100%" height="100%" fill="white"/>
+<style>
+text{font-family:Arial, sans-serif; font-size:14px; fill:#333;}
+</style>
+<text x="600.0" y="40" text-anchor="middle" font-size="20">Benchmark Chart: CosmoBroker vs NATS (Mar 22, 2026)</text>
+<text x="600.0" y="80" text-anchor="middle" font-size="16">Throughput per Run (msg/sec)</text>
+<line x1="60" y1="380" x2="1140" y2="380" stroke="#333"/>
+<line x1="60" y1="60" x2="60" y2="380" stroke="#333"/>
+<rect x="88.4" y="130.7280794717921" width="75.6" height="249.2719205282079" fill="#2a9d8f"/>
+<rect x="172.0" y="216.7121531776577" width="75.6" height="163.2878468223423" fill="#e76f51"/>
+<text x="168.0" y="398" text-anchor="middle">1</text>
+<rect x="304.4" y="111.2411725654764" width="75.6" height="268.7588274345236" fill="#2a9d8f"/>
+<rect x="388.0" y="133.0481758913836" width="75.6" height="246.9518241086164" fill="#e76f51"/>
+<text x="384.0" y="398" text-anchor="middle">2</text>
+<rect x="520.4" y="95.91109186219086" width="75.6" height="284.08890813780914" fill="#2a9d8f"/>
+<rect x="604.0" y="108.8972884177278" width="75.6" height="271.1027115822722" fill="#e76f51"/>
+<text x="600.0" y="398" text-anchor="middle">3</text>
+<rect x="736.4" y="90.0" width="75.6" height="290.0" fill="#2a9d8f"/>
+<rect x="820.0" y="157.1159649013438" width="75.6" height="222.8840350986562" fill="#e76f51"/>
+<text x="816.0" y="398" text-anchor="middle">4</text>
+<rect x="952.4" y="135.86559441431334" width="75.6" height="244.13440558568666" fill="#2a9d8f"/>
+<rect x="1036.0" y="124.77068083212208" width="75.6" height="255.22931916787792" fill="#e76f51"/>
+<text x="1032.0" y="398" text-anchor="middle">5</text>
+<rect x="920" y="70" width="12" height="12" fill="#2a9d8f"/>
+<text x="940" y="80">CosmoBroker</text>
+<rect x="1030" y="70" width="12" height="12" fill="#e76f51"/>
+<text x="1050" y="80">NATS</text>
+<text x="600.0" y="440" text-anchor="middle" font-size="16">Latency per Run (ms)</text>
+<line x1="60" y1="740" x2="1140" y2="740" stroke="#333"/>
+<line x1="60" y1="420" x2="60" y2="740" stroke="#333"/>
+<path d="M 168.0 697.6 L 384.0 698.4 L 600.0 692.4 L 816.0 696.9 L 1032.0 688.7" fill="none" stroke="#2a9d8f" stroke-width="2"/>
+<circle cx="168.0" cy="697.6" r="4" fill="#2a9d8f"/>
+<circle cx="384.0" cy="698.4" r="4" fill="#2a9d8f"/>
+<circle cx="600.0" cy="692.4" r="4" fill="#2a9d8f"/>
+<circle cx="816.0" cy="696.9" r="4" fill="#2a9d8f"/>
+<circle cx="1032.0" cy="688.7" r="4" fill="#2a9d8f"/>
+<path d="M 168.0 648.5 L 384.0 653.0 L 600.0 639.6 L 816.0 641.8 L 1032.0 631.4" fill="none" stroke="#1d7874" stroke-width="2"/>
+<circle cx="168.0" cy="648.5" r="4" fill="#1d7874"/>
+<circle cx="384.0" cy="653.0" r="4" fill="#1d7874"/>
+<circle cx="600.0" cy="639.6" r="4" fill="#1d7874"/>
+<circle cx="816.0" cy="641.8" r="4" fill="#1d7874"/>
+<circle cx="1032.0" cy="631.4" r="4" fill="#1d7874"/>
+<path d="M 168.0 589.1 L 384.0 594.3 L 600.0 596.5 L 816.0 593.5 L 1032.0 601.7" fill="none" stroke="#e76f51" stroke-width="2"/>
+<circle cx="168.0" cy="589.1" r="4" fill="#e76f51"/>
+<circle cx="384.0" cy="594.3" r="4" fill="#e76f51"/>
+<circle cx="600.0" cy="596.5" r="4" fill="#e76f51"/>
+<circle cx="816.0" cy="593.5" r="4" fill="#e76f51"/>
+<circle cx="1032.0" cy="601.7" r="4" fill="#e76f51"/>
+<path d="M 168.0 468.6 L 384.0 481.2 L 600.0 454.5 L 816.0 505.8 L 1032.0 450.0" fill="none" stroke="#b63c2e" stroke-width="2"/>
+<circle cx="168.0" cy="468.6" r="4" fill="#b63c2e"/>
+<circle cx="384.0" cy="481.2" r="4" fill="#b63c2e"/>
+<circle cx="600.0" cy="454.5" r="4" fill="#b63c2e"/>
+<circle cx="816.0" cy="505.8" r="4" fill="#b63c2e"/>
+<circle cx="1032.0" cy="450.0" r="4" fill="#b63c2e"/>
+<text x="168.0" y="758" text-anchor="middle">1</text>
+<text x="384.0" y="758" text-anchor="middle">2</text>
+<text x="600.0" y="758" text-anchor="middle">3</text>
+<text x="816.0" y="758" text-anchor="middle">4</text>
+<text x="1032.0" y="758" text-anchor="middle">5</text>
+<rect x="760" y="420" width="12" height="12" fill="#2a9d8f"/>
+<text x="778" y="430">Cosmo Avg</text>
+<rect x="940" y="420" width="12" height="12" fill="#1d7874"/>
+<text x="958" y="430">Cosmo P99</text>
+<rect x="760" y="438" width="12" height="12" fill="#e76f51"/>
+<text x="778" y="448">NATS Avg</text>
+<rect x="940" y="438" width="12" height="12" fill="#b63c2e"/>
+<text x="958" y="448">NATS P99</text>
+</svg>

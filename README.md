@@ -8,14 +8,155 @@
 
 CosmoBroker is optimized for high-throughput and low-latency workloads. In standard NATS benchmarks (Release mode), it outperforms official NATS in native environments.
 
-### Benchmark: CosmoBroker vs. Official NATS
-*Test Environment: Local TCP, 100,000 messages, 128-byte payloads.*
+### Benchmark: CosmoBroker vs. Official NATS (March 22, 2026)
+*Test Environment: Local TCP, 100,000 messages, 128-byte payloads, 1 publisher, 5 runs.*
 
 | Metric | Official NATS (Docker) | **CosmoBroker (Native)** |
 | :--- | :---: | :---: |
-| **Throughput (PUB)** | ~1,016,000 msg/sec | **~1,222,000 msg/sec** |
-| **Average Latency (RTT)** | 0.183 ms | **0.070 ms** |
-| **Minimum Latency** | 0.122 ms | **0.020 ms** |
+| **Throughput (PUB, avg)** | 731,126 msg/sec | **842,611 msg/sec** |
+| **Throughput (min / max)** | 514,828 / 854,756 msg/sec | **769,728 / 914,337 msg/sec** |
+| **Average Latency (RTT, avg)** | 0.195 ms | **0.061 ms** |
+| **P99 Latency (RTT, avg)** | 0.360 ms | **0.131 ms** |
+
+Full raw output (5 runs):
+```text
+--- RUN 1 ---
+6fec01d7ae393e78193fa1b1c5e50423640fff18490c37d38f1f53f3939b10ab
+Benchmarking CosmoBroker at nats://localhost:4226
+Messages: 100,000, Payload: 128 bytes, Publishers: 1
+--- Throughput + Tail Drop (PUB/SUB) ---
+Sent: 100,000 in 0.13s (785,926 msg/sec)
+Received: 100,000, Dropped: 0 (0.00%)
+--- Latency (RTT via Ping) ---
+Avg RTT: 0.057 ms
+P50 RTT: 0.054 ms
+P95 RTT: 0.094 ms
+P99 RTT: 0.123 ms
+Done.
+Benchmarking nats-server (docker) at nats://localhost:4225
+Messages: 100,000, Payload: 128 bytes, Publishers: 1
+--- Throughput + Tail Drop (PUB/SUB) ---
+Sent: 100,000 in 0.19s (514,828 msg/sec)
+Received: 100,000, Dropped: 0 (0.00%)
+--- Latency (RTT via Ping) ---
+Avg RTT: 0.203 ms
+P50 RTT: 0.194 ms
+P95 RTT: 0.281 ms
+P99 RTT: 0.365 ms
+Done.
+
+--- RUN 2 ---
+619e96321c6c889c92ec0227a406642c26c145e5a479632df2581728708e5676
+Benchmarking CosmoBroker at nats://localhost:4226
+Messages: 100,000, Payload: 128 bytes, Publishers: 1
+--- Throughput + Tail Drop (PUB/SUB) ---
+Sent: 100,000 in 0.12s (847,366 msg/sec)
+Received: 100,000, Dropped: 0 (0.00%)
+--- Latency (RTT via Ping) ---
+Avg RTT: 0.056 ms
+P50 RTT: 0.052 ms
+P95 RTT: 0.092 ms
+P99 RTT: 0.117 ms
+Done.
+Benchmarking nats-server (docker) at nats://localhost:4225
+Messages: 100,000, Payload: 128 bytes, Publishers: 1
+--- Throughput + Tail Drop (PUB/SUB) ---
+Sent: 100,000 in 0.13s (778,611 msg/sec)
+Received: 100,000, Dropped: 0 (0.00%)
+--- Latency (RTT via Ping) ---
+Avg RTT: 0.196 ms
+P50 RTT: 0.185 ms
+P95 RTT: 0.283 ms
+P99 RTT: 0.348 ms
+Done.
+
+--- RUN 3 ---
+6c797d7ed656878872ec33573632dba11bc1a7e02a4d85805de709fc645747e7
+Benchmarking CosmoBroker at nats://localhost:4226
+Messages: 100,000, Payload: 128 bytes, Publishers: 1
+--- Throughput + Tail Drop (PUB/SUB) ---
+Sent: 100,000 in 0.11s (895,700 msg/sec)
+Received: 100,000, Dropped: 0 (0.00%)
+--- Latency (RTT via Ping) ---
+Avg RTT: 0.064 ms
+P50 RTT: 0.060 ms
+P95 RTT: 0.103 ms
+P99 RTT: 0.135 ms
+Done.
+Benchmarking nats-server (docker) at nats://localhost:4225
+Messages: 100,000, Payload: 128 bytes, Publishers: 1
+--- Throughput + Tail Drop (PUB/SUB) ---
+Sent: 100,000 in 0.12s (854,756 msg/sec)
+Received: 100,000, Dropped: 0 (0.00%)
+--- Latency (RTT via Ping) ---
+Avg RTT: 0.193 ms
+P50 RTT: 0.180 ms
+P95 RTT: 0.280 ms
+P99 RTT: 0.384 ms
+Done.
+
+--- RUN 4 ---
+36fc5e5f637959c6ed5e2cbf6f64cae8437c59f202a7d3db860819ec85a467ba
+Benchmarking CosmoBroker at nats://localhost:4226
+Messages: 100,000, Payload: 128 bytes, Publishers: 1
+--- Throughput + Tail Drop (PUB/SUB) ---
+Sent: 100,000 in 0.11s (914,337 msg/sec)
+Received: 100,000, Dropped: 0 (0.00%)
+--- Latency (RTT via Ping) ---
+Avg RTT: 0.058 ms
+P50 RTT: 0.052 ms
+P95 RTT: 0.099 ms
+P99 RTT: 0.132 ms
+Done.
+Benchmarking nats-server (docker) at nats://localhost:4225
+Messages: 100,000, Payload: 128 bytes, Publishers: 1
+--- Throughput + Tail Drop (PUB/SUB) ---
+Sent: 100,000 in 0.14s (702,728 msg/sec)
+Received: 100,000, Dropped: 0 (0.00%)
+--- Latency (RTT via Ping) ---
+Avg RTT: 0.197 ms
+P50 RTT: 0.189 ms
+P95 RTT: 0.263 ms
+P99 RTT: 0.315 ms
+Done.
+
+--- RUN 5 ---
+a554536e4a41547b99b76f4c52482709e75b56b0f6ca68a6e20e6e90e70578d4
+Benchmarking CosmoBroker at nats://localhost:4226
+Messages: 100,000, Payload: 128 bytes, Publishers: 1
+--- Throughput + Tail Drop (PUB/SUB) ---
+Sent: 100,000 in 0.13s (769,728 msg/sec)
+Received: 100,000, Dropped: 0 (0.00%)
+--- Latency (RTT via Ping) ---
+Avg RTT: 0.069 ms
+P50 RTT: 0.065 ms
+P95 RTT: 0.120 ms
+P99 RTT: 0.146 ms
+Done.
+Benchmarking nats-server (docker) at nats://localhost:4225
+Messages: 100,000, Payload: 128 bytes, Publishers: 1
+--- Throughput + Tail Drop (PUB/SUB) ---
+Sent: 100,000 in 0.12s (804,709 msg/sec)
+Received: 100,000, Dropped: 0 (0.00%)
+--- Latency (RTT via Ping) ---
+Avg RTT: 0.186 ms
+P50 RTT: 0.177 ms
+P95 RTT: 0.255 ms
+P99 RTT: 0.390 ms
+Done.
+```
+
+Chart (per run):
+| Run | CosmoBroker Throughput | CosmoBroker Avg RTT | CosmoBroker P99 RTT | NATS Throughput | NATS Avg RTT | NATS P99 RTT |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| 1 | 785,926 msg/sec | 0.057 ms | 0.123 ms | 514,828 msg/sec | 0.203 ms | 0.365 ms |
+| 2 | 847,366 msg/sec | 0.056 ms | 0.117 ms | 778,611 msg/sec | 0.196 ms | 0.348 ms |
+| 3 | 895,700 msg/sec | 0.064 ms | 0.135 ms | 854,756 msg/sec | 0.193 ms | 0.384 ms |
+| 4 | 914,337 msg/sec | 0.058 ms | 0.132 ms | 702,728 msg/sec | 0.197 ms | 0.315 ms |
+| 5 | 769,728 msg/sec | 0.069 ms | 0.146 ms | 804,709 msg/sec | 0.186 ms | 0.390 ms |
+
+Embedded image:
+![Benchmark chart: CosmoBroker vs NATS (Mar 22, 2026)](docs/bench-2026-03-22.svg)
 
 ---
 
