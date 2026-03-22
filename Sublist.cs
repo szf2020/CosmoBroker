@@ -64,6 +64,7 @@ public sealed class Sublist
     private int _wildcardCount = 0;
 
     private const int CacheMax = 4096;
+    private int _cacheEvicting = 0; // 1 while a thread is evicting
     private static readonly byte[] WildcardStar = [(byte)'*'];
     private static readonly byte[] WildcardChevron = [(byte)'>'];
 
@@ -254,7 +255,18 @@ public sealed class Sublist
         }
         finally { _mu.ExitReadLock(); }
 
-        if (_cache.Count >= CacheMax) _cache.Clear();
+        // Evict half the cache when full. Only one thread evicts at a time;
+        // others skip and add their entry — avoiding thundering-herd full-clear.
+        if (_cache.Count >= CacheMax && Interlocked.CompareExchange(ref _cacheEvicting, 1, 0) == 0)
+        {
+            int toRemove = CacheMax / 2;
+            foreach (var key in _cache.Keys)
+            {
+                if (toRemove-- <= 0) break;
+                _cache.TryRemove(key, out _);
+            }
+            Volatile.Write(ref _cacheEvicting, 0);
+        }
         lookup.TryAdd(subject, result);
         return result;
     }

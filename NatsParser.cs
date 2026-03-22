@@ -20,7 +20,7 @@ public static class NatsParser
         if (StartsWith(lineSpan, "INFO"))
         {
             if (connection.IsRoute || connection.IsLeaf) return;
-            _ = connection.SendInfo();
+            connection.SendInfo();
             return;
         }
 

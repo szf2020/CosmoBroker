@@ -170,7 +170,7 @@ public class BrokerConnection
                 if (_protocol == ProtocolType.Unknown || _protocol == ProtocolType.NATS)
                 {
                     _protocol = ProtocolType.NATS;
-                    await SendInfo();
+                    SendInfo();
                 }
             });
         }
@@ -206,20 +206,15 @@ public class BrokerConnection
         await Task.CompletedTask;
     }
 
-    public async Task SendInfo()
+    public void SendInfo()
     {
         bool authRequired = _authenticator != null;
-        string nonce = DefaultNonce;
-        bool ldm = _server?.GetVarz() is { } v && (bool)((dynamic)v).lame_duck_mode;
-        
-        string infoJson = $"{{\"server_id\":\"cosmo-broker\",\"version\":\"1.0.0\",\"auth_required\":{authRequired.ToString().ToLower()},\"nonce\":\"{nonce}\",\"lame_duck_mode\":{ldm.ToString().ToLower()},\"headers\":true,\"max_payload\":1048576}}";
-        string infoStr = $"INFO {infoJson}\r\n";
-        
-        byte[] bytes = Encoding.UTF8.GetBytes(infoStr);
+        byte[] bytes = _server != null
+            ? _server.GetInfoBytes(authRequired)
+            : BrokerServer.BuildInfoBytes(authRequired, lameDuck: false);
         BytesOut += bytes.Length;
         Interlocked.Add(ref _bytesOutTotal, bytes.Length);
         EnqueueBuffer(bytes, bytes.Length, pooled: false);
-        await Task.CompletedTask;
     }
 
     private async Task FillPipeAsync(Stream stream, PipeWriter writer)

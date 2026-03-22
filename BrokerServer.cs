@@ -33,7 +33,30 @@ public class BrokerServer : IAsyncDisposable
     private long _totalConnections = 0;
     private readonly List<IPEndPoint> _peerEndPoints = new();
     private bool _lameDuckMode = false;
+    public bool LameDuckMode => _lameDuckMode;
     public bool UseSublist { get; set; } = true;
+
+    // Cached INFO response bytes. Two variants (auth/no-auth) for the common case.
+    // Lame-duck mode is rare; its bytes are built on demand and not cached.
+    private byte[]? _infoNoAuth;
+    private byte[]? _infoAuth;
+
+    public byte[] GetInfoBytes(bool authRequired)
+    {
+        if (_lameDuckMode)
+            return BuildInfoBytes(authRequired, lameDuck: true);
+        if (authRequired)
+            return _infoAuth ??= BuildInfoBytes(true, lameDuck: false);
+        return _infoNoAuth ??= BuildInfoBytes(false, lameDuck: false);
+    }
+
+    internal static byte[] BuildInfoBytes(bool authRequired, bool lameDuck)
+    {
+        string auth = authRequired ? "true" : "false";
+        string ldm  = lameDuck    ? "true" : "false";
+        string msg  = $"INFO {{\"server_id\":\"cosmo-broker\",\"version\":\"1.0.0\",\"auth_required\":{auth},\"nonce\":\"secure_nonce_12345\",\"lame_duck_mode\":{ldm},\"headers\":true,\"max_payload\":1048576}}\r\n";
+        return System.Text.Encoding.UTF8.GetBytes(msg);
+    }
 
     public BrokerServer(int port = 4222, Persistence.MessageRepository? repo = null, Auth.IAuthenticator? authenticator = null, X509Certificate2? serverCertificate = null, int monitorPort = 8222)
     {
@@ -77,7 +100,7 @@ public class BrokerServer : IAsyncDisposable
         if (_lameDuckMode) return;
         _lameDuckMode = true;
         Console.WriteLine("[CosmoBroker] Entering Lame Duck Mode. Notifying clients...");
-        foreach (var conn in _connections.Keys) _ = conn.SendInfo();
+        foreach (var conn in _connections.Keys) conn.SendInfo();
         _listenSocket?.Close(); 
     }
 
