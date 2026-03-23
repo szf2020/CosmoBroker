@@ -11,4 +11,8 @@
     <PackageReference Include="NATS.Client.Core" Version="2.7.3" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\CosmoBroker.Client\CosmoBroker.Client.csproj" />
+  </ItemGroup>
+
 </Project>
