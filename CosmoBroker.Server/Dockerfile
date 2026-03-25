@@ -8,9 +8,9 @@ COPY CosmoBroker.Server/CosmoBroker.Server.csproj CosmoBroker.Server/
 COPY CosmoBroker.csproj ./
 RUN dotnet restore CosmoBroker.Server/CosmoBroker.Server.csproj
 
-# Copy full source and publish (--no-restore: restore was already done above)
+# Copy full source and publish
 COPY . .
-RUN dotnet publish CosmoBroker.Server/CosmoBroker.Server.csproj -c Release --no-restore -o /app/publish
+RUN dotnet publish CosmoBroker.Server/CosmoBroker.Server.csproj -c Release -o /app/publish
 
 # Runtime stage — use runtime-deps (smaller) since we publish a self-contained app
 FROM mcr.microsoft.com/dotnet/runtime:10.0
