@@ -12,6 +12,7 @@ internal readonly struct ParsedCommand
     public readonly string Subject;
     public readonly string? ReplyTo;
     public readonly ReadOnlySequence<byte> Payload;
+    public readonly int HdrSize;
 
     public ParsedCommand(CommandType type)
     {
@@ -19,14 +20,16 @@ internal readonly struct ParsedCommand
         Subject = string.Empty;
         ReplyTo = null;
         Payload = ReadOnlySequence<byte>.Empty;
+        HdrSize = 0;
     }
 
-    public ParsedCommand(CommandType type, string subject, string? replyTo, ReadOnlySequence<byte> payload)
+    public ParsedCommand(CommandType type, string subject, string? replyTo, ReadOnlySequence<byte> payload, int hdrSize = 0)
     {
         Type = type;
         Subject = subject;
         ReplyTo = replyTo;
         Payload = payload;
+        HdrSize = hdrSize;
     }
 }
 
@@ -85,11 +88,13 @@ internal static class ProtocolParser
             remaining = remaining.Slice(spaceIdx + 1);
         }
 
-        // HMSG has an extra hdr_bytes token before total_bytes — skip it
+        // HMSG has an extra hdr_bytes token before total_bytes — capture it
+        int hdrSize = 0;
         if (type == CommandType.HMsg)
         {
             spaceIdx = remaining.IndexOf((byte)' ');
             if (spaceIdx < 0) { buffer = buffer.Slice(reader.Position); cmd = new ParsedCommand(type); return true; }
+            Utf8Parser.TryParse(remaining.Slice(0, spaceIdx), out hdrSize, out _);
             remaining = remaining.Slice(spaceIdx + 1);
         }
 
@@ -105,7 +110,7 @@ internal static class ProtocolParser
 
         var payload = buffer.Slice(reader.Position, payloadSize);
         buffer = buffer.Slice(buffer.GetPosition(payloadSize + 2, reader.Position));
-        cmd = new ParsedCommand(type, subject, replyTo, payload);
+        cmd = new ParsedCommand(type, subject, replyTo, payload, hdrSize);
         return true;
     }
 }

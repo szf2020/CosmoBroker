@@ -1,10 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
-using CosmoBroker.Client.Models;
 
 namespace CosmoBroker.Client;
 
@@ -22,28 +22,22 @@ public class CosmoJetStream
     public async Task CreateStreamAsync(StreamConfig config, CancellationToken ct = default)
     {
         var subject = $"{_prefix}.STREAM.CREATE.{config.Name}";
-        var json = JsonSerializer.Serialize(config);
-        var bytes = System.Text.Encoding.UTF8.GetBytes(json);
+        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(config));
 
         var reply = await _client.RequestAsync(subject, bytes, TimeSpan.FromSeconds(5), ct);
-        var replyJson = reply.GetStringData();
-
-        if (replyJson.Contains("\"error\""))
-        {
-            throw new Exception($"Failed to create stream: {replyJson}");
-        }
+        var response = JsonSerializer.Deserialize<JsApiResponse>(reply.GetStringData());
+        if (response?.Error != null)
+            throw new Exception($"JetStream error {response.Error.Code}: {response.Error.Description}");
     }
-    
-    public async Task PublishAsync(string subject, ReadOnlyMemory<byte> payload, CancellationToken ct = default)
+
+    public async Task<JsPubAck> PublishAsync(string subject, ReadOnlyMemory<byte> payload, CancellationToken ct = default)
     {
-        // JetStream publish expects an ack
         var reply = await _client.RequestAsync(subject, payload, TimeSpan.FromSeconds(5), ct);
-        var replyJson = reply.GetStringData();
-        
-        if (replyJson.Contains("\"error\""))
-        {
-            throw new Exception($"Failed to publish to stream: {replyJson}");
-        }
+        var ack = JsonSerializer.Deserialize<JsPubAck>(reply.GetStringData())
+                  ?? throw new Exception("JetStream publish: empty ack response.");
+        if (ack.Error != null)
+            throw new Exception($"JetStream error {ack.Error.Code}: {ack.Error.Description}");
+        return ack;
     }
 }
 
@@ -54,4 +48,34 @@ public class StreamConfig
 
     [JsonPropertyName("subjects")]
     public List<string>? Subjects { get; set; }
+}
+
+public class JsPubAck
+{
+    [JsonPropertyName("stream")]
+    public string Stream { get; set; } = "";
+
+    [JsonPropertyName("seq")]
+    public ulong Seq { get; set; }
+
+    [JsonPropertyName("duplicate")]
+    public bool Duplicate { get; set; }
+
+    [JsonPropertyName("error")]
+    public JsApiError? Error { get; set; }
+}
+
+internal class JsApiResponse
+{
+    [JsonPropertyName("error")]
+    public JsApiError? Error { get; set; }
+}
+
+public class JsApiError
+{
+    [JsonPropertyName("code")]
+    public int Code { get; set; }
+
+    [JsonPropertyName("description")]
+    public string Description { get; set; } = "";
 }

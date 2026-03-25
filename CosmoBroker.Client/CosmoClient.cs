@@ -14,6 +14,7 @@ namespace CosmoBroker.Client;
 public class CosmoClient : IAsyncDisposable
 {
     private readonly CosmoConnection _connection;
+    private readonly string _inboxPrefix = $"_INBOX.{Guid.NewGuid():N}.";
     private long _nextSid = 0;
 
     private readonly ConcurrentDictionary<string, Channel<CosmoMessage>> _exactSubscriptions =
@@ -32,7 +33,12 @@ public class CosmoClient : IAsyncDisposable
         _connection.OnMessage = HandleIncomingMessage;
     }
 
-    public Task ConnectAsync(CancellationToken ct = default) => _connection.ConnectAsync(ct);
+    public async Task ConnectAsync(CancellationToken ct = default)
+    {
+        await _connection.ConnectAsync(ct);
+        var sid = Interlocked.Increment(ref _nextSid);
+        await _connection.SendCommandAsync($"SUB {_inboxPrefix}* {sid}", ct);
+    }
 
     public Task PingAsync(CancellationToken ct = default) => _connection.PingAsync(ct);
 
@@ -69,17 +75,31 @@ public class CosmoClient : IAsyncDisposable
         if (pattern.EndsWith(".>"))
             return subject.StartsWith(pattern.AsSpan(0, pattern.Length - 1), StringComparison.OrdinalIgnoreCase);
 
-        var patternParts = pattern.Split('.');
-        var subjectParts = subject.Split('.');
+        // Allocation-free span-based token matching.
+        var pSpan = pattern.AsSpan();
+        var sSpan = subject.AsSpan();
 
-        for (int i = 0; i < patternParts.Length; i++)
+        while (true)
         {
-            if (patternParts[i] == ">") return true;
-            if (i >= subjectParts.Length) return false;
-            if (patternParts[i] != "*" && !string.Equals(patternParts[i], subjectParts[i], StringComparison.OrdinalIgnoreCase))
-                return false;
+            int pDot = pSpan.IndexOf('.');
+            int sDot = sSpan.IndexOf('.');
+
+            var pTok = pDot >= 0 ? pSpan.Slice(0, pDot) : pSpan;
+            var sTok = sDot >= 0 ? sSpan.Slice(0, sDot) : sSpan;
+
+            if (pTok.Equals(">", StringComparison.Ordinal)) return true;
+            if (sSpan.IsEmpty && !pSpan.IsEmpty) return false;
+            if (!pTok.Equals("*", StringComparison.Ordinal) &&
+                !pTok.Equals(sTok, StringComparison.OrdinalIgnoreCase)) return false;
+
+            bool pDone = pDot < 0;
+            bool sDone = sDot < 0;
+            if (pDone && sDone) return true;
+            if (pDone || sDone) return false;
+
+            pSpan = pSpan.Slice(pDot + 1);
+            sSpan = sSpan.Slice(sDot + 1);
         }
-        return patternParts.Length == subjectParts.Length;
     }
 
     public ValueTask PublishAsync(string subject, ReadOnlySequence<byte> payload, string? replyTo = null, CancellationToken ct = default)
@@ -96,27 +116,23 @@ public class CosmoClient : IAsyncDisposable
 
     public async Task<CosmoMessage> RequestAsync(string subject, ReadOnlyMemory<byte> payload, TimeSpan? timeout = null, CancellationToken ct = default)
     {
-        var inbox = $"_INBOX.{Guid.NewGuid():N}";
+        var inbox = $"{_inboxPrefix}{Guid.NewGuid():N}";
         var tcs = new TaskCompletionSource<CosmoMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cts.CancelAfter(timeout ?? TimeSpan.FromSeconds(5));
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(timeout ?? TimeSpan.FromSeconds(5));
 
-        var sid = Interlocked.Increment(ref _nextSid);
         _requests[inbox] = tcs;
-
-        await _connection.SendCommandAsync($"SUB {inbox} {sid}", ct);
         await PublishAsync(subject, payload, inbox, ct);
 
         try
         {
-            using var reg = cts.Token.Register(() => tcs.TrySetCanceled());
+            using var reg = timeoutCts.Token.Register(() => tcs.TrySetCanceled());
             return await tcs.Task;
         }
         finally
         {
             _requests.TryRemove(inbox, out _);
-            _ = _connection.SendCommandAsync($"UNSUB {sid}");
         }
     }
 
@@ -129,8 +145,8 @@ public class CosmoClient : IAsyncDisposable
         if (isWildcard)
         {
             _wildcardLock.EnterWriteLock();
-            _wildcardSubscriptions.Add((subject, channel));
-            _wildcardLock.ExitWriteLock();
+            try { _wildcardSubscriptions.Add((subject, channel)); }
+            finally { _wildcardLock.ExitWriteLock(); }
         }
         else
         {
@@ -150,14 +166,15 @@ public class CosmoClient : IAsyncDisposable
             if (isWildcard)
             {
                 _wildcardLock.EnterWriteLock();
-                _wildcardSubscriptions.RemoveAll(x => x.Pattern == subject && x.Channel == channel);
-                _wildcardLock.ExitWriteLock();
+                try { _wildcardSubscriptions.RemoveAll(x => x.Pattern == subject && x.Channel == channel); }
+                finally { _wildcardLock.ExitWriteLock(); }
             }
             else
             {
                 _exactSubscriptions.TryRemove(subject, out _);
             }
-            await _connection.SendCommandAsync($"UNSUB {sid}", CancellationToken.None);
+            using var unsubCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            await _connection.SendCommandAsync($"UNSUB {sid}", unsubCts.Token).ConfigureAwait(false);
         }
     }
 
@@ -165,8 +182,8 @@ public class CosmoClient : IAsyncDisposable
     {
         foreach (var sub in _exactSubscriptions.Values) sub.Writer.TryComplete();
         _wildcardLock.EnterReadLock();
-        foreach (var sub in _wildcardSubscriptions) sub.Channel.Writer.TryComplete();
-        _wildcardLock.ExitReadLock();
+        try { foreach (var sub in _wildcardSubscriptions) sub.Channel.Writer.TryComplete(); }
+        finally { _wildcardLock.ExitReadLock(); }
 
         await _connection.DisposeAsync();
         _wildcardLock.Dispose();

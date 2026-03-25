@@ -82,6 +82,7 @@ class Program
         }
 
         await Task.WhenAll(publishers);
+        await pubConn.PingAsync(); // flush: ensure server has received all messages before stopping clock
         sw.Stop();
 
         // Wait for receiver to catch up

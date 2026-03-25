@@ -36,7 +36,9 @@ public sealed class Sublist
         public Node? Chevron;
     }
 
-    public sealed record SubEntry(BrokerConnection Conn, string Sid, string? Queue);
+    // State carries the BrokerConnection.Subscription object (opaque here, cast at use site)
+    // so the hot-path message delivery can skip the _subscriptions dict lookup.
+    public sealed record SubEntry(BrokerConnection Conn, string Sid, string? Queue, object? State = null);
 
     public sealed class SublistResult
     {
@@ -70,7 +72,7 @@ public sealed class Sublist
 
     public bool HasWildcards => Volatile.Read(ref _wildcardCount) > 0;
 
-    public void Add(string subject, BrokerConnection conn, string sid, string? queueGroup)
+    public void Add(string subject, BrokerConnection conn, string sid, string? queueGroup, object? state = null)
     {
         bool hasWildcard = HasWildcard(subject);
         var subjectBytes = System.Text.Encoding.UTF8.GetBytes(subject);
@@ -89,7 +91,7 @@ public sealed class Sublist
             }
             node = GetOrAddNode(node, subjectBytes.AsSpan(start));
 
-            var entry = new SubEntry(conn, sid, queueGroup);
+            var entry = new SubEntry(conn, sid, queueGroup, state);
             if (string.IsNullOrEmpty(queueGroup))
             {
                 node.Psubs.Add(entry);
@@ -166,11 +168,11 @@ public sealed class Sublist
 
             if (string.IsNullOrEmpty(queueGroup))
             {
-                node.Psubs.RemoveAll(s => s.Conn == conn && s.Sid == sid);
+                RemoveEntry(node.Psubs, conn, sid);
             }
             else if (node.Qsubs.TryGetValue(queueGroup, out var group))
             {
-                group.Members.RemoveAll(s => s.Conn == conn && s.Sid == sid);
+                RemoveEntry(group.Members, conn, sid);
                 if (group.Members.Count == 0) node.Qsubs.Remove(queueGroup);
             }
 
@@ -201,6 +203,20 @@ public sealed class Sublist
         finally { _mu.ExitWriteLock(); }
     }
 
+    // Removes the first matching entry without allocating a delegate closure.
+    private static void RemoveEntry(List<SubEntry> list, BrokerConnection conn, string sid)
+    {
+        for (int i = list.Count - 1; i >= 0; i--)
+        {
+            var e = list[i];
+            if (e.Conn == conn && e.Sid == sid)
+            {
+                list.RemoveAt(i);
+                break;
+            }
+        }
+    }
+
     private bool TryGetNode(Node node, ReadOnlySpan<byte> tok, out Node? next)
     {
         if (tok.SequenceEqual(WildcardStar))
@@ -224,8 +240,9 @@ public sealed class Sublist
             var lookup = _literal.GetAlternateLookup<ReadOnlySpan<byte>>();
             if (lookup.TryGetValue(subject, out var node))
             {
-                psubs = node.Psubs;
-                qsubs = node.Qsubs;
+                // Return copies — callers iterate outside the lock; live references race with Add/Remove.
+                psubs = new List<SubEntry>(node.Psubs);
+                qsubs = new Dictionary<string, QueueGroup>(node.Qsubs, StringComparer.Ordinal);
                 return true;
             }
         }
@@ -259,13 +276,16 @@ public sealed class Sublist
         // others skip and add their entry — avoiding thundering-herd full-clear.
         if (_cache.Count >= CacheMax && Interlocked.CompareExchange(ref _cacheEvicting, 1, 0) == 0)
         {
-            int toRemove = CacheMax / 2;
-            foreach (var key in _cache.Keys)
+            try
             {
-                if (toRemove-- <= 0) break;
-                _cache.TryRemove(key, out _);
+                int toRemove = CacheMax / 2;
+                foreach (var key in _cache.Keys)
+                {
+                    if (--toRemove < 0) break;
+                    _cache.TryRemove(key, out _);
+                }
             }
-            Volatile.Write(ref _cacheEvicting, 0);
+            finally { Volatile.Write(ref _cacheEvicting, 0); }
         }
         lookup.TryAdd(subject, result);
         return result;

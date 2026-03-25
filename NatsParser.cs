@@ -102,7 +102,10 @@ public static class NatsParser
                         _ = connection.HandleConnect(options);
                     }
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    connection.SendError($"Invalid CONNECT: {ex.Message}");
+                }
             }
         }
     }

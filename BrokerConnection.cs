@@ -31,7 +31,14 @@ public class BrokerConnection
     private static long _lastPerfLog;
 
     private const int MaxPayloadBytes = 1048576;
-    private const string DefaultNonce = "secure_nonce_12345";
+    private readonly string _nonce = GenerateNonce();
+
+    private static string GenerateNonce()
+    {
+        Span<byte> bytes = stackalloc byte[18]; // 18 bytes → 24-char base64
+        System.Security.Cryptography.RandomNumberGenerator.Fill(bytes);
+        return Convert.ToBase64String(bytes);
+    }
     private readonly Stream _stream;
     private readonly bool _sendInfoOnConnect;
     private readonly string _remoteEndPoint;
@@ -51,7 +58,7 @@ public class BrokerConnection
         WebSocket
     }
 
-    private ProtocolType _protocol = ProtocolType.Unknown;
+    private volatile ProtocolType _protocol = ProtocolType.Unknown;
     private bool _isAuthenticated = false;
     private bool _certAuthenticated = false;
     public bool IsRoute { get; set; } = false;
@@ -64,8 +71,6 @@ public class BrokerConnection
 
     public long BytesIn { get; private set; }
     public long BytesOut { get; private set; }
-    private long _bytesInTotal = 0;
-    private long _bytesOutTotal = 0;
     private long _droppedMsgs = 0;
     private long _pendingBytes = 0;
     public long MsgIn { get; private set; }
@@ -91,6 +96,13 @@ public class BrokerConnection
     private readonly ConcurrentDictionary<string, byte[]> _stringByteCache = new();
     private static readonly ThreadLocal<L1MatchCache> MatchCache = new(() => new L1MatchCache());
 
+    // Batch-flush: connections written during a ProcessPipeAsync drain, flushed once at end.
+    [ThreadStatic] private static bool t_batchFlushActive;
+    [ThreadStatic] private static List<BrokerConnection>? t_batchFlushList;
+
+    // Scatter-gather: reusable segment list for multi-segment socket sends.
+    private readonly List<ArraySegment<byte>> _sendSegments = new(8);
+
     public object GetStats() => new {
         protocol = _protocol.ToString(),
         remote_addr = _remoteEndPoint,
@@ -108,9 +120,11 @@ public class BrokerConnection
         public string Subject { get; init; } = string.Empty;
         public string? QueueGroup { get; init; }
         public int? MaxMsgs { get; set; }
-        public int ReceivedMsgs { get; set; }
+        public int ReceivedMsgs; // accessed via Interlocked
         public bool IsRemote { get; set; } = false;
         public byte[]? CachedSidPart { get; set; } // " <sid> " encoded
+        // Ensures MaxMsgs auto-unsubscribe fires exactly once across concurrent deliveries.
+        public int UnsubscribedFlag; // 0 = live, 1 = unsubscribed (Interlocked)
     }
 
     private readonly ConcurrentDictionary<string, Subscription> _subscriptions = new();
@@ -140,11 +154,13 @@ public class BrokerConnection
         _readerPipe = new Pipe(new PipeOptions(
             pauseWriterThreshold: 64 * 1024 * 1024,
             resumeWriterThreshold: 32 * 1024 * 1024,
+            minimumSegmentSize: 64 * 1024,
             useSynchronizationContext: false
         ));
         _sendPipe = new Pipe(new PipeOptions(
             pauseWriterThreshold: MaxBufferedBytes,
             resumeWriterThreshold: SoftLimitBytes,
+            minimumSegmentSize: 16 * 1024,
             useSynchronizationContext: false
         ));
         _sendInfoOnConnect = sendInfoOnConnect;
@@ -176,6 +192,13 @@ public class BrokerConnection
         }
 
         await Task.WhenAny(readTask, processTask, sendTask);
+        // Cancel the other two tasks so they exit cleanly.
+        _readerPipe.Writer.CancelPendingFlush();
+        await _readerPipe.Writer.CompleteAsync();
+        _sendPipe.Writer.CancelPendingFlush();
+        await _sendPipe.Writer.CompleteAsync();
+        _stream.Close();
+        await Task.WhenAll(readTask, processTask, sendTask).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
         Cleanup();
     }
 
@@ -197,29 +220,27 @@ public class BrokerConnection
             .Select(s => (s.Value.Subject, s.Key, s.Value.QueueGroup));
     }
 
-    public async Task SendRawAsync(string rawCommand)
+    public Task SendRawAsync(string rawCommand)
     {
         var bytes = Encoding.UTF8.GetBytes(rawCommand);
         BytesOut += bytes.Length;
-        Interlocked.Add(ref _bytesOutTotal, bytes.Length);
         EnqueueBuffer(bytes, bytes.Length, pooled: false);
-        await Task.CompletedTask;
+        return Task.CompletedTask;
     }
 
     public void SendInfo()
     {
         bool authRequired = _authenticator != null;
-        byte[] bytes = _server != null
-            ? _server.GetInfoBytes(authRequired)
-            : BrokerServer.BuildInfoBytes(authRequired, lameDuck: false);
+        // Always build per-connection bytes so the unique nonce is included.
+        // For unauthenticated connections the nonce field is unused but still unique.
+        byte[] bytes = BrokerServer.BuildInfoBytes(authRequired, _server?.LameDuckMode ?? false, _nonce);
         BytesOut += bytes.Length;
-        Interlocked.Add(ref _bytesOutTotal, bytes.Length);
         EnqueueBuffer(bytes, bytes.Length, pooled: false);
     }
 
     private async Task FillPipeAsync(Stream stream, PipeWriter writer)
     {
-        const int minimumBufferSize = 1024;
+        const int minimumBufferSize = 64 * 1024;
         try
         {
             while (true)
@@ -228,13 +249,13 @@ public class BrokerConnection
                 int bytesRead = await stream.ReadAsync(memory);
                 if (bytesRead == 0) break;
                 BytesIn += bytesRead;
-                Interlocked.Add(ref _bytesInTotal, bytesRead);
                 writer.Advance(bytesRead);
                 var result = await writer.FlushAsync();
                 if (result.IsCompleted || result.IsCanceled) break;
             }
         }
-        catch { }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) when (ex is not OutOfMemoryException) { Console.Error.WriteLine($"[CosmoBroker] FillPipeAsync: {ex.Message}"); }
         finally { await writer.CompleteAsync(); }
     }
 
@@ -298,7 +319,7 @@ public class BrokerConnection
                         {
                             if (sub.Conn == this && NoEcho) continue;
                             if ((IsRoute || IsLeaf) && (sub.Conn.IsRoute || sub.Conn.IsLeaf)) continue;
-                            if (!sub.Conn.SendMessageWithTTL(subject, sub.Sid, fullPayload, replyToStr, null))
+                            if (!sub.Conn.SendMessageDirect(sub, subject, fullPayload, replyToStr))
                                 accepted = false;
                         }
                     }
@@ -367,6 +388,11 @@ public class BrokerConnection
             {
                 var result = await reader.ReadAsync();
                 var buffer = result.Buffer;
+
+                // Activate batch-flush: all SendMessageWithTTL calls during this drain
+                // cycle will queue their connections here; we flush them all at once below.
+                t_batchFlushActive = true;
+                (t_batchFlushList ??= new List<BrokerConnection>()).Clear();
 
                 while (true)
                 {
@@ -550,13 +576,24 @@ public class BrokerConnection
                     buffer = buffer.Slice(buffer.GetPosition(1, linePosition.Value));
                 }
 
+                // Deactivate batch-flush and flush all subscriber pipes once.
+                t_batchFlushActive = false;
+                var bfl = t_batchFlushList;
+                if (bfl != null && bfl.Count > 0)
+                {
+                    foreach (var c in bfl)
+                        _ = c._sendPipe.Writer.FlushAsync();
+                    bfl.Clear();
+                }
+
                 _ = _sendPipe.Writer.FlushAsync();
 
                 reader.AdvanceTo(buffer.Start, buffer.End);
                 if (result.IsCompleted) break;
             }
         }
-        catch { }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) when (ex is not OutOfMemoryException) { Console.Error.WriteLine($"[CosmoBroker] ProcessPipeAsync: {ex.Message}"); }
         finally { await reader.CompleteAsync(); }
     }
 
@@ -568,11 +605,13 @@ public class BrokerConnection
             {
                 var response = WebSockets.WebSocketFramer.CreateHandshakeResponse(request);
                 BytesOut += response.Length;
-                Interlocked.Add(ref _bytesOutTotal, response.Length);
                 EnqueueBuffer(response, response.Length, pooled: false);
                 buffer = buffer.Slice(bytesConsumed);
                 _wsHandshakeComplete = true;
-                _isAuthenticated = true;
+                // Do NOT set _isAuthenticated here — WebSocket clients must go through
+                // the normal NATS CONNECT+auth flow after the WebSocket framing is established.
+                // Unauthenticated connections are authenticated only when no authenticator is configured.
+                if (_authenticator == null) _isAuthenticated = true;
                 return true;
             }
             return false;
@@ -592,11 +631,12 @@ public class BrokerConnection
             switch (packetType)
             {
                 case 1:
+                    // Only auto-authenticate MQTT CONNECT when no authenticator is configured.
+                    // With an authenticator, the MQTT credentials in the payload should be validated.
+                    if (_authenticator == null) _isAuthenticated = true;
                     var ack = MQTT.MqttParser.CreateConnAck();
                     BytesOut += ack.Length;
-                    Interlocked.Add(ref _bytesOutTotal, ack.Length);
                     EnqueueBuffer(ack, ack.Length, pooled: false);
-                    _isAuthenticated = true;
                     break;
                 case 3:
                     if (payload.Length > 2)
@@ -622,14 +662,12 @@ public class BrokerConnection
                         }
                         var sack = MQTT.MqttParser.CreateSubAck(packetId);
                         BytesOut += sack.Length;
-                        Interlocked.Add(ref _bytesOutTotal, sack.Length);
                         EnqueueBuffer(sack, sack.Length, pooled: false);
                     }
                     break;
                 case 12:
                     var resp = MQTT.MqttParser.CreatePingResp();
                     BytesOut += resp.Length;
-                    Interlocked.Add(ref _bytesOutTotal, resp.Length);
                     EnqueueBuffer(resp, resp.Length, pooled: false);
                     break;
             }
@@ -651,25 +689,31 @@ public class BrokerConnection
 
                 try
                 {
-                    if (socket != null && buffer.Length > 1024)
+                    if (socket != null)
                     {
-                        // Per-segment send using ReadOnlyMemory overload, which guarantees
-                        // all bytes are delivered (no partial-write data loss).
-                        foreach (var memory in buffer)
+                        if (buffer.IsSingleSegment)
                         {
-                            await socket.SendAsync(memory, SocketFlags.None);
+                            await socket.SendAsync(buffer.First, SocketFlags.None);
                         }
-                        Interlocked.Add(ref _pendingBytes, -(long)buffer.Length);
+                        else
+                        {
+                            // Scatter-gather: one syscall for all segments.
+                            _sendSegments.Clear();
+                            foreach (var mem in buffer)
+                            {
+                                if (System.Runtime.InteropServices.MemoryMarshal.TryGetArray(mem, out var seg))
+                                    _sendSegments.Add(seg);
+                            }
+                            socket.Send(_sendSegments, SocketFlags.None);
+                        }
                     }
                     else
                     {
                         foreach (var memory in buffer)
-                        {
                             await stream.WriteAsync(memory);
-                        }
                         await stream.FlushAsync();
-                        Interlocked.Add(ref _pendingBytes, -(long)buffer.Length);
                     }
+                    Interlocked.Add(ref _pendingBytes, -(long)buffer.Length);
                 }
                 finally
                 {
@@ -688,8 +732,8 @@ public class BrokerConnection
     {
         if (IsRoute) return true;
         if (Account == null) return false;
-        if (Account.DenyPublish.Any(p => subject.StartsWith(p))) return false;
-        if (Account.AllowPublish.Count > 0 && !Account.AllowPublish.Any(p => subject.StartsWith(p))) return false;
+        if (Account.DenyPublish.Any(p => subject.StartsWith(p, StringComparison.Ordinal))) return false;
+        if (Account.AllowPublish.Count > 0 && !Account.AllowPublish.Any(p => subject.StartsWith(p, StringComparison.Ordinal))) return false;
         return true;
     }
 
@@ -697,8 +741,8 @@ public class BrokerConnection
     {
         if (IsRoute) return true;
         if (Account == null) return false;
-        if (Account.DenySubscribe.Any(p => subject.StartsWith(p))) return false;
-        if (Account.AllowSubscribe.Count > 0 && !Account.AllowSubscribe.Any(p => subject.StartsWith(p))) return false;
+        if (Account.DenySubscribe.Any(p => subject.StartsWith(p, StringComparison.Ordinal))) return false;
+        if (Account.AllowSubscribe.Count > 0 && !Account.AllowSubscribe.Any(p => subject.StartsWith(p, StringComparison.Ordinal))) return false;
         return true;
     }
 
@@ -718,7 +762,7 @@ public class BrokerConnection
         var sub = new Subscription { Subject = scopedSubject, QueueGroup = queueGroup, IsRemote = isRemote, CachedSidPart = sidPart };
         _subscriptions[sid] = sub;
         _topicTree.Subscribe(scopedSubject, this, sid, queueGroup);
-        if (_server?.UseSublist == true) _server.AddSublist(scopedSubject, this, sid, queueGroup);
+        if (_server?.UseSublist == true) _server.AddSublist(scopedSubject, this, sid, queueGroup, sub);
         
         if (!isRemote)
         {
@@ -811,10 +855,15 @@ public class BrokerConnection
                 if (scopedSubject.StartsWith("$JS.API.", StringComparison.OrdinalIgnoreCase))
                 {
                     var payloadBytes = payload.ToArray();
+                    var capturedReplyTo = scopedReplyTo;
                     _ = Task.Run(async () => {
-                        var response = await _jetStream.HandleApiRequest(scopedSubject, payloadBytes);
-                        if (response != null && !string.IsNullOrEmpty(replyTo))
-                            _topicTree.Publish(replyTo, new ReadOnlySequence<byte>(response), source: this);
+                        try
+                        {
+                            var response = await _jetStream.HandleApiRequest(scopedSubject, payloadBytes);
+                            if (response != null && !string.IsNullOrEmpty(capturedReplyTo))
+                                _topicTree.Publish(capturedReplyTo, new ReadOnlySequence<byte>(response), source: this);
+                        }
+                        catch (Exception ex) { Console.Error.WriteLine($"[JetStream] API request error: {ex.Message}"); }
                     });
                     return;
                 }
@@ -848,7 +897,14 @@ public class BrokerConnection
             }
 
             if (_repo != null && scopedSubject.StartsWith("persist.", StringComparison.OrdinalIgnoreCase))
-                _ = Task.Run(async () => await _repo.SaveMessageAsync(scopedSubject, payload.ToArray()));
+            {
+                var persistPayload = payload.ToArray();
+                var persistSubject = scopedSubject;
+                _ = Task.Run(async () => {
+                    try { await _repo.SaveMessageAsync(persistSubject, persistPayload); }
+                    catch (Exception ex) { Console.Error.WriteLine($"[Persist] SaveMessageAsync error: {ex.Message}"); }
+                });
+            }
 
             if (_jetStream.HasStreams)
             {
@@ -862,7 +918,6 @@ public class BrokerConnection
     public void HandlePing()
     {
         BytesOut += Pong.Length;
-        Interlocked.Add(ref _bytesOutTotal, Pong.Length);
         EnqueueBuffer(Pong, Pong.Length, pooled: false);
     }
 
@@ -877,7 +932,6 @@ public class BrokerConnection
             User = new Auth.User { Name = "route", AccountName = "global" };
             var ok = "+OK\r\n"u8;
             BytesOut += ok.Length;
-            Interlocked.Add(ref _bytesOutTotal, ok.Length);
             EnqueueBuffer(ok.ToArray(), ok.Length, pooled: false);
             return;
         }
@@ -897,7 +951,7 @@ public class BrokerConnection
                     return;
                 }
 
-                if (!VerifyEd25519Signature(options.Nkey, options.Sig, DefaultNonce))
+                if (!VerifyEd25519Signature(options.Nkey, options.Sig, _nonce))
                 {
                     SendError("Invalid NKEY signature");
                     await Task.Delay(50);
@@ -910,7 +964,6 @@ public class BrokerConnection
             {
                 var ok = "+OK\r\n"u8;
                 BytesOut += ok.Length;
-                Interlocked.Add(ref _bytesOutTotal, ok.Length);
                 EnqueueBuffer(ok.ToArray(), ok.Length, pooled: false);
                 return;
             }
@@ -929,7 +982,6 @@ public class BrokerConnection
                 User = result.User;
                 var ok = "+OK\r\n"u8;
                 BytesOut += ok.Length;
-                Interlocked.Add(ref _bytesOutTotal, ok.Length);
                 EnqueueBuffer(ok.ToArray(), ok.Length, pooled: false);
             }
         }
@@ -1025,14 +1077,109 @@ public class BrokerConnection
         return new OutboundBuffer(buffer, offset, pooled: true);
     }
 
+    /// <summary>
+    /// Fast-path delivery: subscription object carried directly from SubEntry.State,
+    /// skipping the ConcurrentDictionary lookup on the hot path.
+    /// </summary>
+    internal bool SendMessageDirect(Sublist.SubEntry entry, ReadOnlySpan<byte> subject, ReadOnlySequence<byte> payload, string? replyTo)
+    {
+        var sub = entry.State as Subscription;
+        if (sub == null)
+            return SendMessageWithTTL(subject, entry.Sid, payload, replyTo, null);
+        return SendMessageWithSubDirect(sub, entry.Sid, subject, payload, replyTo);
+    }
+
+    private bool SendMessageWithSubDirect(Subscription sub, string sid, ReadOnlySpan<byte> subject, ReadOnlySequence<byte> payload, string? replyTo)
+    {
+        int received = Interlocked.Increment(ref sub.ReceivedMsgs);
+        MsgOut++;
+
+        ReadOnlySpan<byte> clientSubject = subject;
+        if (Account != null && !string.IsNullOrEmpty(Account.SubjectPrefix))
+        {
+            var prefix = GetCachedBytes(Account.SubjectPrefix);
+            if (subject.Length > prefix.Length && subject.StartsWith(prefix) && subject[prefix.Length] == '.')
+                clientSubject = subject.Slice(prefix.Length + 1);
+        }
+
+        if (_protocol == ProtocolType.MQTT || _protocol == ProtocolType.WebSocket)
+            return SendMessageWithTTL(subject, sid, payload, replyTo, null);
+
+        var writer = _sendPipe.Writer;
+        int totalPayloadLen = (int)payload.Length;
+        Span<byte> totPayloadLenBuf = stackalloc byte[16];
+        Utf8Formatter.TryFormat(totalPayloadLen, totPayloadLenBuf, out int totPayloadLenLen);
+
+        int headerEstimate = 32 + clientSubject.Length + (sub.CachedSidPart?.Length ?? 16) + (replyTo?.Length ?? 0) + totPayloadLenLen;
+        var span = writer.GetSpan(headerEstimate);
+        int offset = 0;
+
+        MsgVerb.CopyTo(span.Slice(offset));
+        offset += MsgVerb.Length;
+        clientSubject.CopyTo(span.Slice(offset));
+        offset += clientSubject.Length;
+
+        if (sub.CachedSidPart != null)
+        {
+            sub.CachedSidPart.CopyTo(span.Slice(offset));
+            offset += sub.CachedSidPart.Length;
+        }
+        else
+        {
+            Space.CopyTo(span.Slice(offset)); offset += Space.Length;
+            offset += Encoding.UTF8.GetBytes(sid, span.Slice(offset));
+            Space.CopyTo(span.Slice(offset)); offset += Space.Length;
+        }
+
+        if (replyTo != null)
+        {
+            offset += Encoding.UTF8.GetBytes(replyTo, span.Slice(offset));
+            Space.CopyTo(span.Slice(offset));
+            offset += Space.Length;
+        }
+
+        totPayloadLenBuf.Slice(0, totPayloadLenLen).CopyTo(span.Slice(offset));
+        offset += totPayloadLenLen;
+        Crlf.CopyTo(span.Slice(offset));
+        offset += Crlf.Length;
+        writer.Advance(offset);
+
+        foreach (var seg in payload)
+            writer.Write(seg.Span);
+        writer.Write(Crlf);
+
+        int totalWritten = offset + totalPayloadLen + Crlf.Length;
+        BytesOut += totalWritten;
+        Interlocked.Add(ref _pendingBytes, totalWritten);
+        if (t_batchFlushActive)
+            (t_batchFlushList ??= new List<BrokerConnection>()).Add(this);
+        else
+            _ = writer.FlushAsync();
+
+        if (sub.MaxMsgs.HasValue && received >= sub.MaxMsgs.Value)
+        {
+            if (Interlocked.CompareExchange(ref sub.UnsubscribedFlag, 1, 0) == 0)
+            {
+                if (_subscriptions.TryRemove(sid, out _))
+                {
+                    _topicTree.Unsubscribe(sub.Subject, this, sid, sub.QueueGroup);
+                    if (_server?.UseSublist == true) _server.RemoveSublist(sub.Subject, this, sid, sub.QueueGroup);
+                    if (!sub.IsRemote) _server?.NotifyUnsubscription(sid);
+                }
+            }
+        }
+
+        return Volatile.Read(ref _pendingBytes) < SoftLimitBytes;
+    }
+
     public bool SendMessageWithTTL(string subject, string sid, ReadOnlySequence<byte> payload, string? replyTo, TimeSpan? ttl)
     {
         if (!_subscriptions.TryGetValue(sid, out var sub))
         {
             return true;
         }
-        
-        sub.ReceivedMsgs++;
+
+        int received = Interlocked.Increment(ref sub.ReceivedMsgs);
         MsgOut++;
 
         // Optimization: Zero-allocation prefix stripping using string span
@@ -1050,11 +1197,10 @@ public class BrokerConnection
         {
             var frame = MQTT.MqttParser.FramePublish(new string(clientSubject), payload.IsSingleSegment ? payload.FirstSpan : payload.ToArray());
             BytesOut += frame.Length;
-            Interlocked.Add(ref _bytesOutTotal, frame.Length);
             Interlocked.Add(ref _pendingBytes, frame.Length);
             _sendPipe.Writer.Write(frame);
             _ = _sendPipe.Writer.FlushAsync();
-            return Interlocked.Read(ref _pendingBytes) < SoftLimitBytes;
+            return Volatile.Read(ref _pendingBytes) < SoftLimitBytes;
         }
 
         bool useHeaders = ttl.HasValue && SupportsHeaders;
@@ -1079,7 +1225,6 @@ public class BrokerConnection
             var outbound = BuildNatsMessage(subjectBuf.Slice(0, subjectByteCount), sid, replyTo, useHeaders, headerLen, totPayloadLenBuf.Slice(0, totPayloadLenLen), ttlBytes.Slice(0, ttlLen), payload);
             var frame = WebSockets.WebSocketFramer.FrameMessage(outbound.Buffer.AsSpan(0, outbound.Length));
             BytesOut += frame.Length;
-            Interlocked.Add(ref _bytesOutTotal, frame.Length);
             EnqueueBuffer(frame, frame.Length, pooled: false);
             if (outbound.Pooled) ArrayPool<byte>.Shared.Return(outbound.Buffer);
         }
@@ -1149,21 +1294,27 @@ public class BrokerConnection
 
             int totalWritten = offset + totalPayloadLen + Crlf.Length;
             BytesOut += totalWritten;
-            Interlocked.Add(ref _bytesOutTotal, totalWritten);
             Interlocked.Add(ref _pendingBytes, totalWritten);
-            _ = writer.FlushAsync();
+            if (t_batchFlushActive)
+                (t_batchFlushList ??= new List<BrokerConnection>()).Add(this);
+            else
+                _ = writer.FlushAsync();
         }
 
-        if (sub.MaxMsgs.HasValue && sub.ReceivedMsgs >= sub.MaxMsgs.Value)
+        if (sub.MaxMsgs.HasValue && received >= sub.MaxMsgs.Value)
         {
-            if (_subscriptions.TryRemove(sid, out _))
+            if (Interlocked.CompareExchange(ref sub.UnsubscribedFlag, 1, 0) == 0)
             {
-                _topicTree.Unsubscribe(sub.Subject, this, sid, sub.QueueGroup);
-                if (!sub.IsRemote) _server?.NotifyUnsubscription(sid);
+                if (_subscriptions.TryRemove(sid, out _))
+                {
+                    _topicTree.Unsubscribe(sub.Subject, this, sid, sub.QueueGroup);
+                    if (_server?.UseSublist == true) _server.RemoveSublist(sub.Subject, this, sid, sub.QueueGroup);
+                    if (!sub.IsRemote) _server?.NotifyUnsubscription(sid);
+                }
             }
         }
-        
-        return Interlocked.Read(ref _pendingBytes) < SoftLimitBytes;
+
+        return Volatile.Read(ref _pendingBytes) < SoftLimitBytes;
     }
 
     public bool SendMessageWithTTL(ReadOnlySpan<byte> subject, string sid, ReadOnlySequence<byte> payload, string? replyTo, TimeSpan? ttl)
@@ -1172,8 +1323,8 @@ public class BrokerConnection
         {
             return true;
         }
-        
-        sub.ReceivedMsgs++;
+
+        int received = Interlocked.Increment(ref sub.ReceivedMsgs);
         MsgOut++;
 
         // Optimization: Zero-allocation prefix stripping
@@ -1191,11 +1342,10 @@ public class BrokerConnection
         {
             var frame = MQTT.MqttParser.FramePublish(Encoding.UTF8.GetString(clientSubject), payload.IsSingleSegment ? payload.FirstSpan : payload.ToArray());
             BytesOut += frame.Length;
-            Interlocked.Add(ref _bytesOutTotal, frame.Length);
             Interlocked.Add(ref _pendingBytes, frame.Length);
             _sendPipe.Writer.Write(frame);
             _ = _sendPipe.Writer.FlushAsync();
-            return Interlocked.Read(ref _pendingBytes) < SoftLimitBytes;
+            return Volatile.Read(ref _pendingBytes) < SoftLimitBytes;
         }
 
         bool useHeaders = ttl.HasValue && SupportsHeaders;
@@ -1217,7 +1367,6 @@ public class BrokerConnection
             var outbound = BuildNatsMessage(clientSubject, sid, replyTo, useHeaders, headerLen, totPayloadLenBuf.Slice(0, totPayloadLenLen), ttlBytes.Slice(0, ttlLen), payload);
             var frame = WebSockets.WebSocketFramer.FrameMessage(outbound.Buffer.AsSpan(0, outbound.Length));
             BytesOut += frame.Length;
-            Interlocked.Add(ref _bytesOutTotal, frame.Length);
             EnqueueBuffer(frame, frame.Length, pooled: false);
             if (outbound.Pooled) ArrayPool<byte>.Shared.Return(outbound.Buffer);
         }
@@ -1287,28 +1436,33 @@ public class BrokerConnection
 
             int totalWritten = offset + totalPayloadLen + Crlf.Length;
             BytesOut += totalWritten;
-            Interlocked.Add(ref _bytesOutTotal, totalWritten);
             Interlocked.Add(ref _pendingBytes, totalWritten);
-            _ = writer.FlushAsync();
+            if (t_batchFlushActive)
+                (t_batchFlushList ??= new List<BrokerConnection>()).Add(this);
+            else
+                _ = writer.FlushAsync();
         }
 
-        if (sub.MaxMsgs.HasValue && sub.ReceivedMsgs >= sub.MaxMsgs.Value)
+        if (sub.MaxMsgs.HasValue && received >= sub.MaxMsgs.Value)
         {
-            if (_subscriptions.TryRemove(sid, out _))
+            if (Interlocked.CompareExchange(ref sub.UnsubscribedFlag, 1, 0) == 0)
             {
-                _topicTree.Unsubscribe(sub.Subject, this, sid, sub.QueueGroup);
-                if (!sub.IsRemote) _server?.NotifyUnsubscription(sid);
+                if (_subscriptions.TryRemove(sid, out _))
+                {
+                    _topicTree.Unsubscribe(sub.Subject, this, sid, sub.QueueGroup);
+                    if (_server?.UseSublist == true) _server.RemoveSublist(sub.Subject, this, sid, sub.QueueGroup);
+                    if (!sub.IsRemote) _server?.NotifyUnsubscription(sid);
+                }
             }
         }
-        
-        return Interlocked.Read(ref _pendingBytes) < SoftLimitBytes;
+
+        return Volatile.Read(ref _pendingBytes) < SoftLimitBytes;
     }
 
-    private void SendError(string message)
+    internal void SendError(string message)
     {
         var err = Encoding.UTF8.GetBytes($"-ERR '{message}'\r\n");
         BytesOut += err.Length;
-        Interlocked.Add(ref _bytesOutTotal, err.Length);
         EnqueueBuffer(err, err.Length, pooled: false);
     }
 
@@ -1344,7 +1498,13 @@ public class BrokerConnection
 
     private void Cleanup()
     {
-        foreach (var sub in _subscriptions) _topicTree.Unsubscribe(sub.Value.Subject, this, sub.Key, sub.Value.QueueGroup);
+        foreach (var sub in _subscriptions)
+        {
+            _topicTree.Unsubscribe(sub.Value.Subject, this, sub.Key, sub.Value.QueueGroup);
+            // Also clean up Sublist entries to avoid memory leaks and delivery to dead connections.
+            if (_server?.UseSublist == true)
+                _server.RemoveSublist(sub.Value.Subject, this, sub.Key, sub.Value.QueueGroup);
+        }
         _subscriptions.Clear();
         _sendPipe.Writer.Complete();
         try { _stream.Close(); } catch { }

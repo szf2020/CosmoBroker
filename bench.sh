@@ -16,12 +16,12 @@ sleep 20
 
 # --- 3. Run CosmoBroker Benchmark ---
 dotnet run --project CosmoBroker.Benchmarks -c Release -- \
-  --label CosmoBroker --url nats://localhost:4226 \
+  --label CosmoBroker.Client --url nats://localhost:4226 \
   --count 100000 --payload 128 --publishers 1 --latency 1000
 
-# --- 4. Run nats-server Benchmark ---
+# --- 4. Run nats-server Benchmark (using CosmoBroker.Client SDK) ---
 dotnet run --project CosmoBroker.Benchmarks -c Release -- \
-  --label "nats-server (docker)" --url nats://localhost:4225 \
+  --label "CosmoBroker.Client (nats-server)" --url nats://localhost:4225 \
   --count 100000 --payload 128 --publishers 1 --latency 1000
 
 # --- Cleanup ---

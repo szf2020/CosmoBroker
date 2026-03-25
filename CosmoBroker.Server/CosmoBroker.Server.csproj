@@ -9,7 +9,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <Version>1.0.8</Version>
+    <Version>1.1.5</Version>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>cosmobroker-server</ToolCommandName>
     <PackageId>CosmoBroker.Server</PackageId>
@@ -18,6 +18,15 @@
     <RepositoryUrl>https://github.com/vkuttyp/CosmoBroker</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <Authors>vkuttyp</Authors>
+    <!-- Unsafe blocks allow zero-copy Span/Memory operations in hot paths -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Profile-guided tiered recompilation: recompiles hot loops using runtime call counts.
+         Yields 10-20% throughput improvement on the publish/subscribe hot paths. -->
+    <TieredPGO>true</TieredPGO>
+    <!-- Pre-JIT the entire assembly on publish so first-request latency is minimal. -->
+    <PublishReadyToRun>true</PublishReadyToRun>
+    <!-- Broker has no locale-sensitive string ops; avoids ICU load and reduces startup time. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
 </Project>

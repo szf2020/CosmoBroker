@@ -32,7 +32,8 @@ public class BrokerServer : IAsyncDisposable
     private readonly DateTime _startTime = DateTime.UtcNow;
     private long _totalConnections = 0;
     private readonly List<IPEndPoint> _peerEndPoints = new();
-    private bool _lameDuckMode = false;
+    private int _lameDuckModeFlag = 0; // 0 = normal, 1 = lame-duck (Interlocked)
+    private bool _lameDuckMode => Volatile.Read(ref _lameDuckModeFlag) == 1;
     public bool LameDuckMode => _lameDuckMode;
     public bool UseSublist { get; set; } = true;
 
@@ -50,11 +51,11 @@ public class BrokerServer : IAsyncDisposable
         return _infoNoAuth ??= BuildInfoBytes(false, lameDuck: false);
     }
 
-    internal static byte[] BuildInfoBytes(bool authRequired, bool lameDuck)
+    internal static byte[] BuildInfoBytes(bool authRequired, bool lameDuck, string nonce = "")
     {
         string auth = authRequired ? "true" : "false";
         string ldm  = lameDuck    ? "true" : "false";
-        string msg  = $"INFO {{\"server_id\":\"cosmo-broker\",\"version\":\"1.0.0\",\"auth_required\":{auth},\"nonce\":\"secure_nonce_12345\",\"lame_duck_mode\":{ldm},\"headers\":true,\"max_payload\":1048576}}\r\n";
+        string msg  = $"INFO {{\"server_id\":\"cosmo-broker\",\"version\":\"1.0.0\",\"auth_required\":{auth},\"nonce\":\"{nonce}\",\"lame_duck_mode\":{ldm},\"headers\":true,\"max_payload\":1048576}}\r\n";
         return System.Text.Encoding.UTF8.GetBytes(msg);
     }
 
@@ -97,11 +98,10 @@ public class BrokerServer : IAsyncDisposable
 
     public void EnterLameDuckMode()
     {
-        if (_lameDuckMode) return;
-        _lameDuckMode = true;
+        if (Interlocked.CompareExchange(ref _lameDuckModeFlag, 1, 0) != 0) return;
         Console.WriteLine("[CosmoBroker] Entering Lame Duck Mode. Notifying clients...");
         foreach (var conn in _connections.Keys) conn.SendInfo();
-        _listenSocket?.Close(); 
+        _listenSocket?.Close();
     }
 
     public async Task StartAsync(CancellationToken ct = default)
@@ -132,10 +132,9 @@ public class BrokerServer : IAsyncDisposable
         _leafnodes.NotifyLocalSub(subject, sid);
     }
 
-    public void AddSublist(string subject, BrokerConnection conn, string sid, string? queueGroup)
+    public void AddSublist(string subject, BrokerConnection conn, string sid, string? queueGroup, object? state = null)
     {
-        Console.WriteLine($"[Sublist] Adding sub: {subject} sid: {sid}");
-        _sublist.Add(subject, conn, sid, queueGroup);
+        _sublist.Add(subject, conn, sid, queueGroup, state);
     }
     public void RemoveSublist(string subject, BrokerConnection conn, string sid, string? queueGroup) => _sublist.Remove(subject, conn, sid, queueGroup);
     public Sublist.SublistResult MatchSublist(string subject)
@@ -200,8 +199,9 @@ public class BrokerServer : IAsyncDisposable
                 Interlocked.Increment(ref _totalConnections);
                 
                 _ = Task.Run(async () => {
+                    Stream? stream = null;
                     try {
-                        Stream stream = new NetworkStream(socket, ownsSocket: true);
+                        stream = new NetworkStream(socket, ownsSocket: true);
                         Auth.AuthResult? certAuth = null;
 
                         if (_serverCertificate != null)
@@ -225,7 +225,7 @@ public class BrokerServer : IAsyncDisposable
                         _connections[connection] = 0;
                         try { await connection.RunAsync(); } finally { _connections.TryRemove(connection, out _); }
                     }
-                    catch { try { socket.Close(); } catch { } }
+                    catch { try { stream?.Dispose(); } catch { } try { socket.Dispose(); } catch { } }
                 }, ct);
             }
         }
