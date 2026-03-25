@@ -12,10 +12,10 @@ jobs:
     name: NuGet
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
 
@@ -33,7 +33,7 @@ jobs:
     name: Docker Hub
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Extract the semver tag (v1.1.5 → 1.1.5) for the image tag.
       - name: Extract version
