@@ -13,9 +13,13 @@ if (!string.IsNullOrWhiteSpace(envManagementPort) && int.TryParse(envManagementP
 string monitorBaseUrl = Environment.GetEnvironmentVariable("COSMOBROKER_MONITOR_URL")
     ?? "http://127.0.0.1:8222";
 
+var staticRoot = Path.Combine(AppContext.BaseDirectory, "wwwroot");
+if (!Directory.Exists(staticRoot))
+    staticRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../wwwroot"));
+
 builder.ListenOn(managementPort);
 builder.UseExceptionHandler();
-builder.UseStaticFiles(Path.Combine(AppContext.BaseDirectory, "../../../wwwroot"));
+builder.UseStaticFiles(staticRoot);
 builder.AddRazorComponents();
 
 builder.Services.AddSingleton(new BrokerManagementOptions
