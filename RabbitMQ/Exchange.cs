@@ -5,7 +5,7 @@ using System.Linq;
 
 namespace CosmoBroker.RabbitMQ;
 
-public enum ExchangeType { Direct, Fanout, Topic, Headers }
+public enum ExchangeType { Direct, Fanout, Topic, Headers, SuperStream }
 
 /// <summary>
 /// Represents a RabbitMQ-style exchange. Routes incoming messages to bound queues
@@ -18,6 +18,7 @@ public sealed class Exchange
     public ExchangeType Type { get; }
     public bool Durable { get; }
     public bool AutoDelete { get; }
+    public int? SuperStreamPartitions { get; }
 
     // Binding table: routing key → list of bound queues
     // For fanout, all queues are stored under the "" key.
@@ -27,18 +28,19 @@ public sealed class Exchange
     // Headers exchange: binding key → required header pairs
     private readonly ConcurrentDictionary<string, Dictionary<string, string>> _headerArgs = new();
 
-    public Exchange(string name, ExchangeType type, bool durable = true, bool autoDelete = false)
-        : this("/", name, type, durable, autoDelete)
+    public Exchange(string name, ExchangeType type, bool durable = true, bool autoDelete = false, int? superStreamPartitions = null)
+        : this("/", name, type, durable, autoDelete, superStreamPartitions)
     {
     }
 
-    public Exchange(string vhost, string name, ExchangeType type, bool durable = true, bool autoDelete = false)
+    public Exchange(string vhost, string name, ExchangeType type, bool durable = true, bool autoDelete = false, int? superStreamPartitions = null)
     {
         Vhost = string.IsNullOrWhiteSpace(vhost) ? "/" : vhost;
         Name = name;
         Type = type;
         Durable = durable;
         AutoDelete = autoDelete;
+        SuperStreamPartitions = type == ExchangeType.SuperStream ? superStreamPartitions : null;
     }
 
     // --- Binding management --------------------------------------------------
@@ -80,6 +82,7 @@ public sealed class Exchange
             ExchangeType.Fanout   => RouteFanout(),
             ExchangeType.Topic    => RouteTopic(routingKey),
             ExchangeType.Headers  => RouteHeaders(headers),
+            ExchangeType.SuperStream => RouteSuperStream(routingKey),
             _                     => Enumerable.Empty<string>()
         };
     }
@@ -119,6 +122,21 @@ public sealed class Exchange
         }
     }
 
+    private IEnumerable<string> RouteSuperStream(string routingKey)
+    {
+        var partitions = _bindings
+            .SelectMany(x => x.Value)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (partitions.Length == 0)
+            yield break;
+
+        int index = GetStableHash(routingKey) % partitions.Length;
+        yield return partitions[index];
+    }
+
     // --- Topic pattern matching (RabbitMQ semantics: * = one word, # = zero or more) ---
 
     public static bool TopicMatches(string pattern, string routingKey)
@@ -150,12 +168,39 @@ public sealed class Exchange
 
     private string NormaliseKey(string key) => Type == ExchangeType.Fanout ? "" : key;
 
+    private static int GetStableHash(string value)
+    {
+        unchecked
+        {
+            uint hash = 2166136261;
+            foreach (char ch in value ?? string.Empty)
+            {
+                hash ^= ch;
+                hash *= 16777619;
+            }
+
+            return (int)(hash & 0x7fffffff);
+        }
+    }
+
     public IReadOnlyDictionary<string, IReadOnlyList<string>> GetBindings()
     {
         var result = new Dictionary<string, IReadOnlyList<string>>();
         foreach (var (k, bag) in _bindings)
             result[k] = bag.ToList().AsReadOnly();
         return result;
+    }
+
+    public IReadOnlyList<string> GetSuperStreamPartitions()
+    {
+        if (Type != ExchangeType.SuperStream)
+            return Array.Empty<string>();
+
+        return _bindings.Values
+            .SelectMany(static bag => bag)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(static x => x, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
     }
 
     public bool HasBindings()

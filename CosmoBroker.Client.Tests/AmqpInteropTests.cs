@@ -2499,6 +2499,79 @@ public class AmqpInteropTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task AmqpClient_ShouldEnforceStreamMaxLengthMessages()
+    {
+        const int port = 5688;
+        const int brokerPort = 4278;
+        const int monitorPort = 8278;
+
+        await using var server = new BrokerServer(port: brokerPort, amqpPort: port, monitorPort: monitorPort);
+        using var cts = new CancellationTokenSource();
+        await server.StartAsync(cts.Token);
+        await Task.Delay(250);
+
+        var factory = new ConnectionFactory
+        {
+            HostName = "127.0.0.1",
+            Port = port,
+            UserName = "guest",
+            Password = "guest",
+            VirtualHost = "/",
+            DispatchConsumersAsync = true
+        };
+
+        using var connection = factory.CreateConnection();
+        using var setupChannel = connection.CreateModel();
+
+        setupChannel.ExchangeDeclare("amqp.stream.lengthcount.x", ExchangeType.Direct, durable: true, autoDelete: false);
+        setupChannel.QueueDeclare(
+            "amqp.stream.lengthcount.q",
+            durable: true,
+            exclusive: false,
+            autoDelete: false,
+            arguments: new Dictionary<string, object?>
+            {
+                ["x-queue-type"] = "stream",
+                ["x-max-length"] = 1L
+            });
+        setupChannel.QueueBind("amqp.stream.lengthcount.q", "amqp.stream.lengthcount.x", "stream");
+        setupChannel.BasicPublish("amqp.stream.lengthcount.x", "stream", basicProperties: null, body: Encoding.UTF8.GetBytes("1111"));
+        setupChannel.BasicPublish("amqp.stream.lengthcount.x", "stream", basicProperties: null, body: Encoding.UTF8.GetBytes("2222"));
+
+        using (var monitor = new HttpClient())
+        {
+            var rmqz = await monitor.GetStringAsync($"http://127.0.0.1:{monitorPort}/rmqz");
+            using var doc = JsonDocument.Parse(rmqz);
+            var queue = doc.RootElement.GetProperty("queues")
+                .EnumerateArray()
+                .FirstOrDefault(x => x.TryGetProperty("name", out var name) && name.GetString() == "amqp.stream.lengthcount.q");
+            Assert.True(queue.ValueKind != JsonValueKind.Undefined, rmqz);
+            Assert.Equal("stream", queue.GetProperty("queue_type").GetString());
+            Assert.Equal(1L, queue.GetProperty("stream_max_length_messages").GetInt64());
+        }
+
+        using var channel = connection.CreateModel();
+        var delivered = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var consumer = new AsyncEventingBasicConsumer(channel);
+        consumer.Received += async (_, ea) =>
+        {
+            delivered.TrySetResult(Encoding.UTF8.GetString(ea.Body.ToArray()));
+            await Task.CompletedTask;
+        };
+
+        channel.BasicConsume(
+            "amqp.stream.lengthcount.q",
+            autoAck: true,
+            consumerTag: "stream-lengthcount",
+            noLocal: false,
+            exclusive: false,
+            arguments: new Dictionary<string, object?> { ["x-stream-offset"] = "first" },
+            consumer: consumer);
+
+        Assert.Equal("2222", await delivered.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
     public async Task AmqpClient_ShouldEnforceStreamMaxAge()
     {
         const int port = 5684;
@@ -2566,6 +2639,111 @@ public class AmqpInteropTests : IAsyncDisposable
             consumer: consumer);
 
         Assert.Equal("new", await delivered.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task AmqpClient_ShouldDeclareSuperStreamAndRouteByPartition()
+    {
+        const int port = 5689;
+        const int brokerPort = 4279;
+        const int monitorPort = 8279;
+
+        await using var server = new BrokerServer(port: brokerPort, amqpPort: port, monitorPort: monitorPort);
+        using var cts = new CancellationTokenSource();
+        await server.StartAsync(cts.Token);
+        await Task.Delay(250);
+
+        var factory = new ConnectionFactory
+        {
+            HostName = "127.0.0.1",
+            Port = port,
+            UserName = "guest",
+            Password = "guest",
+            VirtualHost = "/",
+            DispatchConsumersAsync = true
+        };
+
+        using var connection = factory.CreateConnection();
+        using var channel = connection.CreateModel();
+
+        channel.ExchangeDeclare(
+            "amqp.super.x",
+            "x-super-stream",
+            durable: true,
+            autoDelete: false,
+            arguments: new Dictionary<string, object?> { ["x-partitions"] = 2L });
+
+        using (var monitor = new HttpClient())
+        {
+            var rmqz = await monitor.GetStringAsync($"http://127.0.0.1:{monitorPort}/rmqz");
+            using var doc = JsonDocument.Parse(rmqz);
+            var exchanges = doc.RootElement.GetProperty("exchanges").EnumerateArray().ToArray();
+            var queues = doc.RootElement.GetProperty("queues").EnumerateArray().ToArray();
+            var superExchange = exchanges.Single(e => e.GetProperty("name").GetString() == "amqp.super.x");
+            Assert.Equal("SuperStream", superExchange.GetProperty("type").GetString());
+            Assert.Equal(2, superExchange.GetProperty("super_stream_partition_count").GetInt32());
+            var partitions = superExchange.GetProperty("super_stream_partitions").EnumerateArray().Select(x => x.GetString()).ToArray();
+            Assert.Equal(new[] { "amqp.super.x-0", "amqp.super.x-1" }, partitions);
+            Assert.Contains(queues, q => q.GetProperty("name").GetString() == "amqp.super.x-0");
+            Assert.Contains(queues, q => q.GetProperty("name").GetString() == "amqp.super.x-1");
+            Assert.All(
+                queues.Where(q => q.GetProperty("name").GetString() is "amqp.super.x-0" or "amqp.super.x-1"),
+                q => Assert.Equal("stream", q.GetProperty("queue_type").GetString()));
+        }
+
+        channel.BasicPublish("amqp.super.x", "customer-42", basicProperties: null, body: Encoding.UTF8.GetBytes("p1"));
+        channel.BasicPublish("amqp.super.x", "customer-42", basicProperties: null, body: Encoding.UTF8.GetBytes("p2"));
+
+        var q0Messages = new List<string>();
+        var q1Messages = new List<string>();
+        var q0Done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var q1Done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        using var q0Channel = connection.CreateModel();
+        using var q1Channel = connection.CreateModel();
+
+        var q0Consumer = new AsyncEventingBasicConsumer(q0Channel);
+        q0Consumer.Received += async (_, ea) =>
+        {
+            q0Messages.Add(Encoding.UTF8.GetString(ea.Body.ToArray()));
+            if (q0Messages.Count >= 2)
+                q0Done.TrySetResult();
+            await Task.CompletedTask;
+        };
+
+        var q1Consumer = new AsyncEventingBasicConsumer(q1Channel);
+        q1Consumer.Received += async (_, ea) =>
+        {
+            q1Messages.Add(Encoding.UTF8.GetString(ea.Body.ToArray()));
+            if (q1Messages.Count >= 2)
+                q1Done.TrySetResult();
+            await Task.CompletedTask;
+        };
+
+        q0Channel.BasicConsume(
+            "amqp.super.x-0",
+            autoAck: true,
+            consumerTag: "super-0",
+            noLocal: false,
+            exclusive: false,
+            arguments: new Dictionary<string, object?> { ["x-stream-offset"] = "first" },
+            consumer: q0Consumer);
+
+        q1Channel.BasicConsume(
+            "amqp.super.x-1",
+            autoAck: true,
+            consumerTag: "super-1",
+            noLocal: false,
+            exclusive: false,
+            arguments: new Dictionary<string, object?> { ["x-stream-offset"] = "first" },
+            consumer: q1Consumer);
+
+        await Task.WhenAny(Task.WhenAll(q0Done.Task, q1Done.Task), Task.Delay(500));
+
+        bool queue0ReceivedBoth = q0Messages.Count == 2 && q1Messages.Count == 0;
+        bool queue1ReceivedBoth = q1Messages.Count == 2 && q0Messages.Count == 0;
+
+        Assert.True(queue0ReceivedBoth || queue1ReceivedBoth, "Expected both messages to hash to the same super-stream partition.");
     }
 
     [Fact]
@@ -3402,5 +3580,391 @@ public class AmqpPersistenceInteropTests
         }
 
         try { File.Delete(dbPath); } catch { }
+    }
+
+    [Fact]
+    public async Task AmqpSuperStream_ShouldSurviveRestart()
+    {
+        string dbPath = Path.Combine(Path.GetTempPath(), $"cosmobroker-amqp-super-stream-{Guid.NewGuid():N}.db");
+        string connectionString = $"Data Source={dbPath};";
+        const int brokerPort1 = 4280;
+        const int monitorPort1 = 8280;
+        const int amqpPort1 = 5690;
+
+        var repo1 = new MessageRepository(connectionString);
+        await using (var server1 = new BrokerServer(port: brokerPort1, amqpPort: amqpPort1, repo: repo1, monitorPort: monitorPort1))
+        {
+            using var cts = new CancellationTokenSource();
+            await server1.StartAsync(cts.Token);
+            await Task.Delay(250);
+
+            var factory = new ConnectionFactory
+            {
+                HostName = "127.0.0.1",
+                Port = amqpPort1,
+                UserName = "guest",
+                Password = "guest",
+                VirtualHost = "/"
+            };
+
+            using var connection = factory.CreateConnection();
+            using var channel = connection.CreateModel();
+            channel.ExchangeDeclare(
+                "amqp.super.persist.x",
+                "x-super-stream",
+                durable: true,
+                autoDelete: false,
+                arguments: new Dictionary<string, object?> { ["x-partitions"] = 2L });
+
+            var props = channel.CreateBasicProperties();
+            props.Persistent = true;
+
+            channel.BasicPublish("amqp.super.persist.x", "tenant-7", props, Encoding.UTF8.GetBytes("persist-1"));
+            channel.BasicPublish("amqp.super.persist.x", "tenant-7", props, Encoding.UTF8.GetBytes("persist-2"));
+            await Task.Delay(150);
+        }
+
+        const int brokerPort2 = 4281;
+        const int monitorPort2 = 8281;
+        const int amqpPort2 = 5691;
+
+        var repo2 = new MessageRepository(connectionString);
+        await using (var server2 = new BrokerServer(port: brokerPort2, amqpPort: amqpPort2, repo: repo2, monitorPort: monitorPort2))
+        {
+            using var cts = new CancellationTokenSource();
+            await server2.StartAsync(cts.Token);
+            await Task.Delay(250);
+
+            using (var monitor = new HttpClient())
+            {
+                var rmqz = await monitor.GetStringAsync($"http://127.0.0.1:{monitorPort2}/rmqz");
+                using var doc = JsonDocument.Parse(rmqz);
+                var exchange = doc.RootElement.GetProperty("exchanges").EnumerateArray()
+                    .Single(x => x.GetProperty("name").GetString() == "amqp.super.persist.x");
+                Assert.Equal("SuperStream", exchange.GetProperty("type").GetString());
+                Assert.Equal(2, exchange.GetProperty("super_stream_partition_count").GetInt32());
+                var partitions = exchange.GetProperty("super_stream_partitions").EnumerateArray().Select(x => x.GetString()).ToArray();
+                Assert.Equal(new[] { "amqp.super.persist.x-0", "amqp.super.persist.x-1" }, partitions);
+            }
+
+            var factory = new ConnectionFactory
+            {
+                HostName = "127.0.0.1",
+                Port = amqpPort2,
+                UserName = "guest",
+                Password = "guest",
+                VirtualHost = "/",
+                DispatchConsumersAsync = true
+            };
+
+            using var connection = factory.CreateConnection();
+            using var q0Channel = connection.CreateModel();
+            using var q1Channel = connection.CreateModel();
+            var q0Messages = new List<string>();
+            var q1Messages = new List<string>();
+            var q0Done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var q1Done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            var q0Consumer = new AsyncEventingBasicConsumer(q0Channel);
+            q0Consumer.Received += async (_, ea) =>
+            {
+                q0Messages.Add(Encoding.UTF8.GetString(ea.Body.ToArray()));
+                if (q0Messages.Count >= 2)
+                    q0Done.TrySetResult();
+                await Task.CompletedTask;
+            };
+
+            var q1Consumer = new AsyncEventingBasicConsumer(q1Channel);
+            q1Consumer.Received += async (_, ea) =>
+            {
+                q1Messages.Add(Encoding.UTF8.GetString(ea.Body.ToArray()));
+                if (q1Messages.Count >= 2)
+                    q1Done.TrySetResult();
+                await Task.CompletedTask;
+            };
+
+            q0Channel.BasicConsume(
+                "amqp.super.persist.x-0",
+                autoAck: true,
+                consumerTag: "super-persist-0",
+                noLocal: false,
+                exclusive: false,
+                arguments: new Dictionary<string, object?> { ["x-stream-offset"] = "first" },
+                consumer: q0Consumer);
+
+            q1Channel.BasicConsume(
+                "amqp.super.persist.x-1",
+                autoAck: true,
+                consumerTag: "super-persist-1",
+                noLocal: false,
+                exclusive: false,
+                arguments: new Dictionary<string, object?> { ["x-stream-offset"] = "first" },
+                consumer: q1Consumer);
+
+            await Task.WhenAny(Task.WhenAll(q0Done.Task, q1Done.Task), Task.Delay(1000));
+
+            bool queue0ReceivedBoth = q0Messages.Count == 2 && q1Messages.Count == 0;
+            bool queue1ReceivedBoth = q1Messages.Count == 2 && q0Messages.Count == 0;
+            Assert.True(queue0ReceivedBoth || queue1ReceivedBoth, "Expected persisted messages to remain on the same super-stream partition after restart.");
+        }
+
+        try { File.Delete(dbPath); } catch { }
+    }
+
+    [Fact]
+    public async Task AmqpMonitor_ShouldResetPersistedSuperStreamOffsets()
+    {
+        string dbPath = Path.Combine(Path.GetTempPath(), $"cosmobroker-amqp-super-reset-{Guid.NewGuid():N}.db");
+        string connectionString = $"Data Source={dbPath};";
+        const int brokerPort = 4282;
+        const int monitorPort = 8282;
+        const int amqpPort = 5692;
+
+        var repo = new MessageRepository(connectionString);
+        await using var server = new BrokerServer(port: brokerPort, amqpPort: amqpPort, repo: repo, monitorPort: monitorPort);
+        using var cts = new CancellationTokenSource();
+        await server.StartAsync(cts.Token);
+        await Task.Delay(250);
+
+        var factory = new ConnectionFactory
+        {
+            HostName = "127.0.0.1",
+            Port = amqpPort,
+            UserName = "guest",
+            Password = "guest",
+            VirtualHost = "/",
+            DispatchConsumersAsync = true
+        };
+
+        string[] partitions;
+        using (var connection = factory.CreateConnection())
+        {
+            using var channel = connection.CreateModel();
+            channel.ExchangeDeclare(
+                "amqp.super.reset.x",
+                "x-super-stream",
+                durable: true,
+                autoDelete: false,
+                arguments: new Dictionary<string, object?> { ["x-partitions"] = 2L });
+
+            using var monitor = new HttpClient();
+            var rmqz = await monitor.GetStringAsync($"http://127.0.0.1:{monitorPort}/rmqz");
+            using var monitorDoc = JsonDocument.Parse(rmqz);
+            partitions = monitorDoc.RootElement.GetProperty("exchanges").EnumerateArray()
+                .Single(x => x.GetProperty("name").GetString() == "amqp.super.reset.x")
+                .GetProperty("super_stream_partitions")
+                .EnumerateArray()
+                .Select(x => x.GetString()!)
+                .ToArray();
+
+            Assert.Equal(2, partitions.Length);
+
+            channel.BasicPublish("", partitions[0], null, Encoding.UTF8.GetBytes("seed-0"));
+            channel.BasicPublish("", partitions[1], null, Encoding.UTF8.GetBytes("seed-1"));
+        }
+
+        using (var client = new HttpClient())
+        {
+            for (int i = 0; i < partitions.Length; i++)
+            {
+                long seedOffset = i == 0 ? 7L : 11L;
+                using var seedResponse = await client.PostAsync(
+                    $"http://127.0.0.1:{monitorPort}/rmq/stream/reset?vhost=%2F&queue={Uri.EscapeDataString(partitions[i])}&consumer=super-reset-consumer&offset={seedOffset}",
+                    content: null);
+                seedResponse.EnsureSuccessStatusCode();
+            }
+        }
+
+        var initialOffsets = partitions.ToDictionary(
+            partition => partition,
+            partition => repo.GetRabbitStreamConsumerOffsetAsync("/", partition, "super-reset-consumer").GetAwaiter().GetResult() ?? -1L,
+            StringComparer.OrdinalIgnoreCase);
+        Assert.Equal(6L, initialOffsets[partitions[0]]);
+        Assert.Equal(10L, initialOffsets[partitions[1]]);
+
+        using (var client = new HttpClient())
+        {
+            using var response = await client.PostAsync(
+                $"http://127.0.0.1:{monitorPort}/rmq/super-stream/reset?vhost=%2F&exchange=amqp.super.reset.x&consumer=super-reset-consumer&offset=first",
+                content: null);
+            response.EnsureSuccessStatusCode();
+            var payload = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(payload);
+            Assert.True(doc.RootElement.GetProperty("ok").GetBoolean(), payload);
+            var resetPartitions = doc.RootElement.GetProperty("partitions").EnumerateObject().ToDictionary(x => x.Name, x => x.Value.GetInt64(), StringComparer.OrdinalIgnoreCase);
+            Assert.Equal(2, resetPartitions.Count);
+            Assert.All(partitions, partition => Assert.True(resetPartitions[partition] < initialOffsets[partition]));
+
+            foreach (var partition in partitions)
+            {
+                var persistedOffset = await repo.GetRabbitStreamConsumerOffsetAsync("/", partition, "super-reset-consumer");
+                Assert.Equal(resetPartitions[partition] - 1, persistedOffset);
+            }
+        }
+
+        try { File.Delete(dbPath); } catch { }
+    }
+
+    [Fact]
+    public async Task AmqpClient_ShouldFailSuperStreamRedeclareWhenPartitionCountDiffers()
+    {
+        const int port = 5693;
+        const int brokerPort = 4283;
+        const int monitorPort = 8283;
+
+        await using var server = new BrokerServer(port: brokerPort, amqpPort: port, monitorPort: monitorPort);
+        using var cts = new CancellationTokenSource();
+        await server.StartAsync(cts.Token);
+        await Task.Delay(250);
+
+        var factory = new ConnectionFactory
+        {
+            HostName = "127.0.0.1",
+            Port = port,
+            UserName = "guest",
+            Password = "guest",
+            VirtualHost = "/"
+        };
+
+        using var connection = factory.CreateConnection();
+        using var channel = connection.CreateModel();
+        channel.ExchangeDeclare(
+            "amqp.super.precondition.x",
+            "x-super-stream",
+            durable: true,
+            autoDelete: false,
+            arguments: new Dictionary<string, object?> { ["x-partitions"] = 2L });
+
+        var ex = Assert.Throws<OperationInterruptedException>(() =>
+        {
+            channel.ExchangeDeclare(
+                "amqp.super.precondition.x",
+                "x-super-stream",
+                durable: true,
+                autoDelete: false,
+                arguments: new Dictionary<string, object?> { ["x-partitions"] = 3L });
+        });
+
+        Assert.Equal((ushort)406, ex.ShutdownReason?.ReplyCode);
+        Assert.Contains("different properties", ex.ShutdownReason?.ReplyText ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task AmqpClient_ShouldUseSuperStreamPartitionHeaderOverride()
+    {
+        const int port = 5694;
+        const int brokerPort = 4284;
+        const int monitorPort = 8284;
+
+        await using var server = new BrokerServer(port: brokerPort, amqpPort: port, monitorPort: monitorPort);
+        using var cts = new CancellationTokenSource();
+        await server.StartAsync(cts.Token);
+        await Task.Delay(250);
+
+        var factory = new ConnectionFactory
+        {
+            HostName = "127.0.0.1",
+            Port = port,
+            UserName = "guest",
+            Password = "guest",
+            VirtualHost = "/",
+            DispatchConsumersAsync = true
+        };
+
+        using var connection = factory.CreateConnection();
+        using var channel = connection.CreateModel();
+        channel.ExchangeDeclare(
+            "amqp.super.header.x",
+            "x-super-stream",
+            durable: true,
+            autoDelete: false,
+            arguments: new Dictionary<string, object?> { ["x-partitions"] = 2L });
+
+        string keyA = "tenant-a";
+        string keyB = "tenant-b";
+        if (GetStablePartitionIndex(keyA, 2) == GetStablePartitionIndex(keyB, 2))
+        {
+            for (int i = 0; i < 16; i++)
+            {
+                keyB = $"tenant-b-{i}";
+                if (GetStablePartitionIndex(keyA, 2) != GetStablePartitionIndex(keyB, 2))
+                    break;
+            }
+        }
+
+        var propsA = channel.CreateBasicProperties();
+        propsA.Headers = new Dictionary<string, object?> { ["x-super-stream-partition-key"] = keyA };
+        var propsB = channel.CreateBasicProperties();
+        propsB.Headers = new Dictionary<string, object?> { ["x-super-stream-partition-key"] = keyB };
+
+        channel.BasicPublish("amqp.super.header.x", "shared-routing-key", propsA, Encoding.UTF8.GetBytes("msg-a"));
+        channel.BasicPublish("amqp.super.header.x", "shared-routing-key", propsB, Encoding.UTF8.GetBytes("msg-b"));
+
+        using var q0Channel = connection.CreateModel();
+        using var q1Channel = connection.CreateModel();
+        var q0Messages = new List<string>();
+        var q1Messages = new List<string>();
+        var q0Done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var q1Done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var q0Consumer = new AsyncEventingBasicConsumer(q0Channel);
+        q0Consumer.Received += async (_, ea) =>
+        {
+            q0Messages.Add(Encoding.UTF8.GetString(ea.Body.ToArray()));
+            if (q0Messages.Count >= 1)
+                q0Done.TrySetResult();
+            await Task.CompletedTask;
+        };
+
+        var q1Consumer = new AsyncEventingBasicConsumer(q1Channel);
+        q1Consumer.Received += async (_, ea) =>
+        {
+            q1Messages.Add(Encoding.UTF8.GetString(ea.Body.ToArray()));
+            if (q1Messages.Count >= 1)
+                q1Done.TrySetResult();
+            await Task.CompletedTask;
+        };
+
+        q0Channel.BasicConsume(
+            "amqp.super.header.x-0",
+            autoAck: true,
+            consumerTag: "super-header-0",
+            noLocal: false,
+            exclusive: false,
+            arguments: new Dictionary<string, object?> { ["x-stream-offset"] = "first" },
+            consumer: q0Consumer);
+
+        q1Channel.BasicConsume(
+            "amqp.super.header.x-1",
+            autoAck: true,
+            consumerTag: "super-header-1",
+            noLocal: false,
+            exclusive: false,
+            arguments: new Dictionary<string, object?> { ["x-stream-offset"] = "first" },
+            consumer: q1Consumer);
+
+        await Task.WhenAny(Task.WhenAll(q0Done.Task, q1Done.Task), Task.Delay(1000));
+
+        int indexA = GetStablePartitionIndex(keyA, 2);
+        int indexB = GetStablePartitionIndex(keyB, 2);
+
+        Assert.NotEqual(indexA, indexB);
+        Assert.Contains("msg-a", indexA == 0 ? q0Messages : q1Messages);
+        Assert.Contains("msg-b", indexB == 0 ? q0Messages : q1Messages);
+    }
+
+    private static int GetStablePartitionIndex(string value, int partitions)
+    {
+        unchecked
+        {
+            uint hash = 2166136261;
+            foreach (char ch in value)
+            {
+                hash ^= ch;
+                hash *= 16777619;
+            }
+
+            return (int)((hash & 0x7fffffff) % partitions);
+        }
     }
 }

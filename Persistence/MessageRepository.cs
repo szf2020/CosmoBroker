@@ -103,6 +103,7 @@ public class MessageRepository
         await EnsureRabbitMessagePropertyColumnAsync(ct);
         await EnsureRabbitBindingDestinationKindColumnAsync(ct);
         await EnsureRabbitQueueTypeColumnAsync(ct);
+        await EnsureRabbitExchangeMetadataColumnsAsync(ct);
         await EnsureRabbitStreamRetentionColumnsAsync(ct);
     }
 
@@ -152,7 +153,8 @@ public class MessageRepository
                 name        TEXT PRIMARY KEY,
                 type        TEXT NOT NULL,
                 durable     INTEGER NOT NULL,
-                auto_delete INTEGER NOT NULL
+                auto_delete INTEGER NOT NULL,
+                super_stream_partitions INTEGER
             );
             CREATE TABLE IF NOT EXISTS rmq_queues (
                 name                    TEXT PRIMARY KEY,
@@ -165,6 +167,7 @@ public class MessageRepository
                 dead_letter_routing_key TEXT,
                 message_ttl_ms          INTEGER,
                 queue_ttl_ms            INTEGER,
+                stream_max_length_messages INTEGER,
                 stream_max_length_bytes INTEGER,
                 stream_max_age_ms       INTEGER
             );
@@ -248,7 +251,8 @@ public class MessageRepository
                 name        TEXT PRIMARY KEY,
                 type        TEXT NOT NULL,
                 durable     BOOLEAN NOT NULL,
-                auto_delete BOOLEAN NOT NULL
+                auto_delete BOOLEAN NOT NULL,
+                super_stream_partitions INTEGER
             );
             CREATE TABLE IF NOT EXISTS rmq_queues (
                 name                    TEXT PRIMARY KEY,
@@ -261,6 +265,7 @@ public class MessageRepository
                 dead_letter_routing_key TEXT,
                 message_ttl_ms          INTEGER,
                 queue_ttl_ms            INTEGER,
+                stream_max_length_messages BIGINT,
                 stream_max_length_bytes BIGINT,
                 stream_max_age_ms       BIGINT
             );
@@ -351,7 +356,8 @@ public class MessageRepository
                 name        NVARCHAR(256) PRIMARY KEY,
                 type        NVARCHAR(64) NOT NULL,
                 durable     BIT NOT NULL,
-                auto_delete BIT NOT NULL
+                auto_delete BIT NOT NULL,
+                super_stream_partitions INT NULL
             );
             IF OBJECT_ID('rmq_queues', 'U') IS NULL
             CREATE TABLE rmq_queues (
@@ -365,6 +371,7 @@ public class MessageRepository
                 dead_letter_routing_key NVARCHAR(256) NULL,
                 message_ttl_ms          INT NULL,
                 queue_ttl_ms            INT NULL,
+                stream_max_length_messages BIGINT NULL,
                 stream_max_length_bytes BIGINT NULL,
                 stream_max_age_ms       BIGINT NULL
             );
@@ -744,8 +751,27 @@ public class MessageRepository
         return ExecuteIgnoreDuplicateColumnAsync(sql, ct);
     }
 
+    private Task EnsureRabbitExchangeMetadataColumnsAsync(CancellationToken ct)
+    {
+        var sql = _provider switch
+        {
+            DatabaseProvider.Postgres => "ALTER TABLE rmq_exchanges ADD COLUMN IF NOT EXISTS super_stream_partitions INTEGER",
+            DatabaseProvider.MsSql => "IF COL_LENGTH('rmq_exchanges', 'super_stream_partitions') IS NULL ALTER TABLE rmq_exchanges ADD super_stream_partitions INT NULL",
+            _ => "ALTER TABLE rmq_exchanges ADD COLUMN super_stream_partitions INTEGER"
+        };
+
+        return ExecuteIgnoreDuplicateColumnAsync(sql, ct);
+    }
+
     private async Task EnsureRabbitStreamRetentionColumnsAsync(CancellationToken ct)
     {
+        var countSql = _provider switch
+        {
+            DatabaseProvider.Postgres => "ALTER TABLE rmq_queues ADD COLUMN IF NOT EXISTS stream_max_length_messages BIGINT",
+            DatabaseProvider.MsSql => "IF COL_LENGTH('rmq_queues', 'stream_max_length_messages') IS NULL ALTER TABLE rmq_queues ADD stream_max_length_messages BIGINT NULL",
+            _ => "ALTER TABLE rmq_queues ADD COLUMN stream_max_length_messages INTEGER"
+        };
+
         var lengthSql = _provider switch
         {
             DatabaseProvider.Postgres => "ALTER TABLE rmq_queues ADD COLUMN IF NOT EXISTS stream_max_length_bytes BIGINT",
@@ -760,6 +786,7 @@ public class MessageRepository
             _ => "ALTER TABLE rmq_queues ADD COLUMN stream_max_age_ms INTEGER"
         };
 
+        await ExecuteIgnoreDuplicateColumnAsync(countSql, ct);
         await ExecuteIgnoreDuplicateColumnAsync(lengthSql, ct);
         await ExecuteIgnoreDuplicateColumnAsync(ageSql, ct);
     }
@@ -1042,28 +1069,29 @@ public class MessageRepository
         }).ToList();
     }
 
-    public Task SaveRabbitExchangeAsync(string name, string type, bool durable, bool autoDelete, CancellationToken ct = default)
-        => SaveRabbitExchangeAsync("/", name, type, durable, autoDelete, ct);
+    public Task SaveRabbitExchangeAsync(string name, string type, bool durable, bool autoDelete, int? superStreamPartitions = null, CancellationToken ct = default)
+        => SaveRabbitExchangeAsync("/", name, type, durable, autoDelete, superStreamPartitions, ct);
 
-    public async Task SaveRabbitExchangeAsync(string vhost, string name, string type, bool durable, bool autoDelete, CancellationToken ct = default)
+    public async Task SaveRabbitExchangeAsync(string vhost, string name, string type, bool durable, bool autoDelete, int? superStreamPartitions = null, CancellationToken ct = default)
     {
         string scopedName = EncodeRabbitScopedName(vhost, name);
         var sql = _provider switch
         {
-            DatabaseProvider.Postgres => "INSERT INTO rmq_exchanges (name, type, durable, auto_delete) VALUES (@name, @type, @durable, @autoDelete) " +
-                                         "ON CONFLICT(name) DO UPDATE SET type = EXCLUDED.type, durable = EXCLUDED.durable, auto_delete = EXCLUDED.auto_delete",
+            DatabaseProvider.Postgres => "INSERT INTO rmq_exchanges (name, type, durable, auto_delete, super_stream_partitions) VALUES (@name, @type, @durable, @autoDelete, @superStreamPartitions) " +
+                                         "ON CONFLICT(name) DO UPDATE SET type = EXCLUDED.type, durable = EXCLUDED.durable, auto_delete = EXCLUDED.auto_delete, super_stream_partitions = EXCLUDED.super_stream_partitions",
             DatabaseProvider.MsSql => "IF EXISTS (SELECT 1 FROM rmq_exchanges WHERE name = @name) " +
-                                      "UPDATE rmq_exchanges SET type = @type, durable = @durable, auto_delete = @autoDelete WHERE name = @name " +
-                                      "ELSE INSERT INTO rmq_exchanges (name, type, durable, auto_delete) VALUES (@name, @type, @durable, @autoDelete)",
-            _ => "INSERT INTO rmq_exchanges (name, type, durable, auto_delete) VALUES (@name, @type, @durable, @autoDelete) " +
-                 "ON CONFLICT(name) DO UPDATE SET type = excluded.type, durable = excluded.durable, auto_delete = excluded.auto_delete"
+                                      "UPDATE rmq_exchanges SET type = @type, durable = @durable, auto_delete = @autoDelete, super_stream_partitions = @superStreamPartitions WHERE name = @name " +
+                                      "ELSE INSERT INTO rmq_exchanges (name, type, durable, auto_delete, super_stream_partitions) VALUES (@name, @type, @durable, @autoDelete, @superStreamPartitions)",
+            _ => "INSERT INTO rmq_exchanges (name, type, durable, auto_delete, super_stream_partitions) VALUES (@name, @type, @durable, @autoDelete, @superStreamPartitions) " +
+                 "ON CONFLICT(name) DO UPDATE SET type = excluded.type, durable = excluded.durable, auto_delete = excluded.auto_delete, super_stream_partitions = excluded.super_stream_partitions"
         };
 
         await _db.ExecuteAsync(sql, new[] {
             SqlParameter.Named("name", SqlValue.From(scopedName)),
             SqlParameter.Named("type", SqlValue.From(type)),
             SqlParameter.Named("durable", SqlValue.From(durable)),
-            SqlParameter.Named("autoDelete", SqlValue.From(autoDelete))
+            SqlParameter.Named("autoDelete", SqlValue.From(autoDelete)),
+            SqlParameter.Named("superStreamPartitions", SqlValue.From(superStreamPartitions ?? 0))
         }, ct: ct);
     }
 
@@ -1087,15 +1115,15 @@ public class MessageRepository
         string scopedName = EncodeRabbitScopedName(vhost, name);
         var sql = _provider switch
         {
-            DatabaseProvider.Postgres => "INSERT INTO rmq_queues (name, queue_type, durable, exclusive, auto_delete, max_priority, dead_letter_exchange, dead_letter_routing_key, message_ttl_ms, queue_ttl_ms, stream_max_length_bytes, stream_max_age_ms) " +
-                                         "VALUES (@name, @queueType, @durable, @exclusive, @autoDelete, @maxPriority, @dlx, @dlrk, @msgTtl, @queueTtl, @streamMaxLengthBytes, @streamMaxAgeMs) " +
-                                         "ON CONFLICT(name) DO UPDATE SET queue_type = EXCLUDED.queue_type, durable = EXCLUDED.durable, exclusive = EXCLUDED.exclusive, auto_delete = EXCLUDED.auto_delete, max_priority = EXCLUDED.max_priority, dead_letter_exchange = EXCLUDED.dead_letter_exchange, dead_letter_routing_key = EXCLUDED.dead_letter_routing_key, message_ttl_ms = EXCLUDED.message_ttl_ms, queue_ttl_ms = EXCLUDED.queue_ttl_ms, stream_max_length_bytes = EXCLUDED.stream_max_length_bytes, stream_max_age_ms = EXCLUDED.stream_max_age_ms",
+            DatabaseProvider.Postgres => "INSERT INTO rmq_queues (name, queue_type, durable, exclusive, auto_delete, max_priority, dead_letter_exchange, dead_letter_routing_key, message_ttl_ms, queue_ttl_ms, stream_max_length_messages, stream_max_length_bytes, stream_max_age_ms) " +
+                                         "VALUES (@name, @queueType, @durable, @exclusive, @autoDelete, @maxPriority, @dlx, @dlrk, @msgTtl, @queueTtl, @streamMaxLengthMessages, @streamMaxLengthBytes, @streamMaxAgeMs) " +
+                                         "ON CONFLICT(name) DO UPDATE SET queue_type = EXCLUDED.queue_type, durable = EXCLUDED.durable, exclusive = EXCLUDED.exclusive, auto_delete = EXCLUDED.auto_delete, max_priority = EXCLUDED.max_priority, dead_letter_exchange = EXCLUDED.dead_letter_exchange, dead_letter_routing_key = EXCLUDED.dead_letter_routing_key, message_ttl_ms = EXCLUDED.message_ttl_ms, queue_ttl_ms = EXCLUDED.queue_ttl_ms, stream_max_length_messages = EXCLUDED.stream_max_length_messages, stream_max_length_bytes = EXCLUDED.stream_max_length_bytes, stream_max_age_ms = EXCLUDED.stream_max_age_ms",
             DatabaseProvider.MsSql => "IF EXISTS (SELECT 1 FROM rmq_queues WHERE name = @name) " +
-                                      "UPDATE rmq_queues SET queue_type = @queueType, durable = @durable, exclusive = @exclusive, auto_delete = @autoDelete, max_priority = @maxPriority, dead_letter_exchange = @dlx, dead_letter_routing_key = @dlrk, message_ttl_ms = @msgTtl, queue_ttl_ms = @queueTtl, stream_max_length_bytes = @streamMaxLengthBytes, stream_max_age_ms = @streamMaxAgeMs WHERE name = @name " +
-                                      "ELSE INSERT INTO rmq_queues (name, queue_type, durable, exclusive, auto_delete, max_priority, dead_letter_exchange, dead_letter_routing_key, message_ttl_ms, queue_ttl_ms, stream_max_length_bytes, stream_max_age_ms) VALUES (@name, @queueType, @durable, @exclusive, @autoDelete, @maxPriority, @dlx, @dlrk, @msgTtl, @queueTtl, @streamMaxLengthBytes, @streamMaxAgeMs)",
-            _ => "INSERT INTO rmq_queues (name, queue_type, durable, exclusive, auto_delete, max_priority, dead_letter_exchange, dead_letter_routing_key, message_ttl_ms, queue_ttl_ms, stream_max_length_bytes, stream_max_age_ms) " +
-                 "VALUES (@name, @queueType, @durable, @exclusive, @autoDelete, @maxPriority, @dlx, @dlrk, @msgTtl, @queueTtl, @streamMaxLengthBytes, @streamMaxAgeMs) " +
-                 "ON CONFLICT(name) DO UPDATE SET queue_type = excluded.queue_type, durable = excluded.durable, exclusive = excluded.exclusive, auto_delete = excluded.auto_delete, max_priority = excluded.max_priority, dead_letter_exchange = excluded.dead_letter_exchange, dead_letter_routing_key = excluded.dead_letter_routing_key, message_ttl_ms = excluded.message_ttl_ms, queue_ttl_ms = excluded.queue_ttl_ms, stream_max_length_bytes = excluded.stream_max_length_bytes, stream_max_age_ms = excluded.stream_max_age_ms"
+                                      "UPDATE rmq_queues SET queue_type = @queueType, durable = @durable, exclusive = @exclusive, auto_delete = @autoDelete, max_priority = @maxPriority, dead_letter_exchange = @dlx, dead_letter_routing_key = @dlrk, message_ttl_ms = @msgTtl, queue_ttl_ms = @queueTtl, stream_max_length_messages = @streamMaxLengthMessages, stream_max_length_bytes = @streamMaxLengthBytes, stream_max_age_ms = @streamMaxAgeMs WHERE name = @name " +
+                                      "ELSE INSERT INTO rmq_queues (name, queue_type, durable, exclusive, auto_delete, max_priority, dead_letter_exchange, dead_letter_routing_key, message_ttl_ms, queue_ttl_ms, stream_max_length_messages, stream_max_length_bytes, stream_max_age_ms) VALUES (@name, @queueType, @durable, @exclusive, @autoDelete, @maxPriority, @dlx, @dlrk, @msgTtl, @queueTtl, @streamMaxLengthMessages, @streamMaxLengthBytes, @streamMaxAgeMs)",
+            _ => "INSERT INTO rmq_queues (name, queue_type, durable, exclusive, auto_delete, max_priority, dead_letter_exchange, dead_letter_routing_key, message_ttl_ms, queue_ttl_ms, stream_max_length_messages, stream_max_length_bytes, stream_max_age_ms) " +
+                 "VALUES (@name, @queueType, @durable, @exclusive, @autoDelete, @maxPriority, @dlx, @dlrk, @msgTtl, @queueTtl, @streamMaxLengthMessages, @streamMaxLengthBytes, @streamMaxAgeMs) " +
+                 "ON CONFLICT(name) DO UPDATE SET queue_type = excluded.queue_type, durable = excluded.durable, exclusive = excluded.exclusive, auto_delete = excluded.auto_delete, max_priority = excluded.max_priority, dead_letter_exchange = excluded.dead_letter_exchange, dead_letter_routing_key = excluded.dead_letter_routing_key, message_ttl_ms = excluded.message_ttl_ms, queue_ttl_ms = excluded.queue_ttl_ms, stream_max_length_messages = excluded.stream_max_length_messages, stream_max_length_bytes = excluded.stream_max_length_bytes, stream_max_age_ms = excluded.stream_max_age_ms"
         };
 
         await _db.ExecuteAsync(sql, new[] {
@@ -1109,6 +1137,7 @@ public class MessageRepository
             SqlParameter.Named("dlrk", SqlValue.From(args.DeadLetterRoutingKey ?? string.Empty)),
             SqlParameter.Named("msgTtl", SqlValue.From(args.MessageTtlMs.HasValue ? args.MessageTtlMs.Value : 0)),
             SqlParameter.Named("queueTtl", SqlValue.From(args.QueueTtlMs.HasValue ? args.QueueTtlMs.Value : 0)),
+            SqlParameter.Named("streamMaxLengthMessages", SqlValue.From(args.StreamMaxLengthMessages.HasValue ? args.StreamMaxLengthMessages.Value : 0L)),
             SqlParameter.Named("streamMaxLengthBytes", SqlValue.From(args.StreamMaxLengthBytes.HasValue ? args.StreamMaxLengthBytes.Value : 0L)),
             SqlParameter.Named("streamMaxAgeMs", SqlValue.From(args.StreamMaxAgeMs.HasValue ? args.StreamMaxAgeMs.Value : 0L))
         }, ct: ct);
@@ -1272,20 +1301,21 @@ public class MessageRepository
 
     public async Task<List<PersistedRabbitExchange>> GetRabbitExchangesAsync(CancellationToken ct = default)
     {
-        var rows = await _db.QueryAsync("SELECT name, type, durable, auto_delete FROM rmq_exchanges ORDER BY name", ct: ct);
+        var rows = await _db.QueryAsync("SELECT name, type, durable, auto_delete, super_stream_partitions FROM rmq_exchanges ORDER BY name", ct: ct);
         return rows.Select(row => new PersistedRabbitExchange
         {
             Vhost = DecodeRabbitScopedName(row["name"].AsString()).Vhost,
             Name = DecodeRabbitScopedName(row["name"].AsString()).Name,
             Type = row["type"].AsString() ?? string.Empty,
             Durable = AsBool(row["durable"]),
-            AutoDelete = AsBool(row["auto_delete"])
+            AutoDelete = AsBool(row["auto_delete"]),
+            SuperStreamPartitions = NullIfZero(row["super_stream_partitions"].AsInt())
         }).ToList();
     }
 
     public async Task<List<PersistedRabbitQueue>> GetRabbitQueuesAsync(CancellationToken ct = default)
     {
-        var rows = await _db.QueryAsync("SELECT name, queue_type, durable, exclusive, auto_delete, max_priority, dead_letter_exchange, dead_letter_routing_key, message_ttl_ms, queue_ttl_ms, stream_max_length_bytes, stream_max_age_ms FROM rmq_queues ORDER BY name", ct: ct);
+        var rows = await _db.QueryAsync("SELECT name, queue_type, durable, exclusive, auto_delete, max_priority, dead_letter_exchange, dead_letter_routing_key, message_ttl_ms, queue_ttl_ms, stream_max_length_messages, stream_max_length_bytes, stream_max_age_ms FROM rmq_queues ORDER BY name", ct: ct);
         return rows.Select(row => new PersistedRabbitQueue
         {
             Vhost = DecodeRabbitScopedName(row["name"].AsString()).Vhost,
@@ -1301,6 +1331,7 @@ public class MessageRepository
             DeadLetterRoutingKey = NullIfEmpty(row["dead_letter_routing_key"].AsString()),
             MessageTtlMs = NullIfZero(row["message_ttl_ms"].AsInt()),
             QueueTtlMs = NullIfZero(row["queue_ttl_ms"].AsInt()),
+            StreamMaxLengthMessages = NullIfZeroLong(row["stream_max_length_messages"].AsInt()),
             StreamMaxLengthBytes = NullIfZeroLong(row["stream_max_length_bytes"].AsInt()),
             StreamMaxAgeMs = NullIfZeroLong(row["stream_max_age_ms"].AsInt())
         }).ToList();
@@ -1498,6 +1529,7 @@ public class PersistedRabbitExchange
     public required string Type { get; set; }
     public bool Durable { get; set; }
     public bool AutoDelete { get; set; }
+    public int? SuperStreamPartitions { get; set; }
 }
 
 public class PersistedRabbitQueue
@@ -1513,6 +1545,7 @@ public class PersistedRabbitQueue
     public string? DeadLetterRoutingKey { get; set; }
     public int? MessageTtlMs { get; set; }
     public int? QueueTtlMs { get; set; }
+    public long? StreamMaxLengthMessages { get; set; }
     public long? StreamMaxLengthBytes { get; set; }
     public long? StreamMaxAgeMs { get; set; }
 }

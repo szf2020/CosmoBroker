@@ -102,10 +102,48 @@ public sealed class RabbitMqStats
     public List<RabbitQueueStats> queues { get; set; } = [];
 }
 
+public sealed class SuperStreamSummary
+{
+    public string vhost { get; set; } = "/";
+    public string name { get; set; } = string.Empty;
+    public int partition_count { get; set; }
+    public List<string> partitions { get; set; } = [];
+    public List<SuperStreamPartitionSummary> partition_details { get; set; } = [];
+    public long messages { get; set; }
+    public long bytes { get; set; }
+    public int consumers { get; set; }
+    public long max_lag { get; set; }
+    public long? min_head_offset { get; set; }
+    public long? max_tail_offset { get; set; }
+    public List<string> retention { get; set; } = [];
+}
+
+public sealed class SuperStreamPartitionSummary
+{
+    public string name { get; set; } = string.Empty;
+    public int messages { get; set; }
+    public long bytes { get; set; }
+    public int consumers { get; set; }
+    public long head_offset { get; set; }
+    public long tail_offset { get; set; }
+    public long max_lag { get; set; }
+    public long? max_length_messages { get; set; }
+    public long? max_length_bytes { get; set; }
+    public long? max_age_ms { get; set; }
+}
+
 public sealed class StreamOffsetResetRequest
 {
     public string vhost { get; set; } = "/";
     public string queue { get; set; } = string.Empty;
+    public string consumer { get; set; } = string.Empty;
+    public string offset { get; set; } = "next";
+}
+
+public sealed class SuperStreamOffsetResetRequest
+{
+    public string vhost { get; set; } = "/";
+    public string exchange { get; set; } = string.Empty;
     public string consumer { get; set; } = string.Empty;
     public string offset { get; set; } = "next";
 }
@@ -120,12 +158,24 @@ public sealed class StreamOffsetResetResult
     public long next_offset { get; set; }
 }
 
+public sealed class SuperStreamOffsetResetResult
+{
+    public bool ok { get; set; }
+    public string? error { get; set; }
+    public string vhost { get; set; } = "/";
+    public string exchange { get; set; } = string.Empty;
+    public string consumer { get; set; } = string.Empty;
+    public Dictionary<string, long> partitions { get; set; } = [];
+}
+
 public sealed class RabbitExchangeStats
 {
     public string? vhost { get; set; }
     public string? name { get; set; }
     public string? type { get; set; }
     public bool durable { get; set; }
+    public int? super_stream_partition_count { get; set; }
+    public List<string> super_stream_partitions { get; set; } = [];
 }
 
 public sealed class RabbitQueueStats
@@ -139,6 +189,7 @@ public sealed class RabbitQueueStats
     public string? queue_type { get; set; }
     public long stream_head_offset { get; set; }
     public long stream_tail_offset { get; set; }
+    public long? stream_max_length_messages { get; set; }
     public long? stream_max_length_bytes { get; set; }
     public long? stream_max_age_ms { get; set; }
     public Dictionary<string, long> stream_offsets { get; set; } = [];

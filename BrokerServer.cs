@@ -217,6 +217,8 @@ public class BrokerServer : IAsyncDisposable
     public object GetRmqz() => _rmqExchanges.GetStats();
     public bool TryResetRabbitStreamOffset(string vhost, string queueName, string consumerTag, RabbitMQ.RabbitStreamOffsetSpec? offset, out string? error, out long nextOffset)
         => _rmqExchanges.TryResetStreamConsumerOffset(vhost, queueName, consumerTag, offset, out error, out nextOffset);
+    public bool TryResetRabbitSuperStreamOffset(string vhost, string exchangeName, string consumerTag, RabbitMQ.RabbitStreamOffsetSpec? offset, out string? error, out Dictionary<string, long> partitionOffsets)
+        => _rmqExchanges.TryResetSuperStreamConsumerOffset(vhost, exchangeName, consumerTag, offset, out error, out partitionOffsets);
     public object GetRoutez() => new { routes = _cluster.RouteCount };
     public object GetGatewayz() => new { gateways = _cluster.GatewayCount };
     public object GetLeafz() => new { leafnodes = _leafnodes.ConnectionCount };

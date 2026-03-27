@@ -15,6 +15,7 @@ namespace CosmoBroker.RabbitMQ;
 public sealed class ExchangeManager
 {
     private const string DefaultVhost = "/";
+    private const string SuperStreamPartitionKeyHeader = "x-super-stream-partition-key";
 
     private readonly MessageRepository? _repo;
     public ConcurrentDictionary<string, Exchange> Exchanges { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -28,19 +29,44 @@ public sealed class ExchangeManager
 
     // --- Exchange lifecycle --------------------------------------------------
 
-    public Exchange DeclareExchange(string name, ExchangeType type, bool durable = true, bool autoDelete = false)
-        => DeclareExchange(DefaultVhost, name, type, durable, autoDelete);
+    public Exchange DeclareExchange(string name, ExchangeType type, bool durable = true, bool autoDelete = false, int? superStreamPartitions = null)
+        => DeclareExchange(DefaultVhost, name, type, durable, autoDelete, superStreamPartitions);
 
-    public Exchange DeclareExchange(string vhost, string name, ExchangeType type, bool durable = true, bool autoDelete = false)
+    public Exchange DeclareExchange(string vhost, string name, ExchangeType type, bool durable = true, bool autoDelete = false, int? superStreamPartitions = null)
     {
         var resolvedVhost = NormalizeVhost(vhost);
         EnsureBuiltInExchanges(resolvedVhost);
         var key = ExchangeKey(resolvedVhost, name);
         if (name.StartsWith("amq.", StringComparison.OrdinalIgnoreCase) && !Exchanges.ContainsKey(key))
             throw new InvalidOperationException($"Exchange name '{name}' is reserved.");
-        var exchange = Exchanges.GetOrAdd(key, _ => new Exchange(resolvedVhost, name, type, durable, autoDelete));
+        var exchange = Exchanges.GetOrAdd(key, _ => new Exchange(resolvedVhost, name, type, durable, autoDelete, superStreamPartitions));
         if (_repo != null && durable && !IsBuiltInExchange(name))
-            _repo.SaveRabbitExchangeAsync(resolvedVhost, name, type.ToString(), durable, autoDelete).GetAwaiter().GetResult();
+            _repo.SaveRabbitExchangeAsync(resolvedVhost, name, type.ToString(), durable, autoDelete, superStreamPartitions).GetAwaiter().GetResult();
+        return exchange;
+    }
+
+    public Exchange DeclareSuperStream(string vhost, string name, int partitions, bool durable = true, bool autoDelete = false)
+    {
+        if (partitions <= 0)
+            throw new InvalidOperationException("Super stream partitions must be greater than zero.");
+
+        var exchange = DeclareExchange(vhost, name, ExchangeType.SuperStream, durable, autoDelete, partitions);
+        var resolvedVhost = NormalizeVhost(vhost);
+
+        for (int i = 0; i < partitions; i++)
+        {
+            string queueName = $"{name}-{i}";
+            var queue = DeclareQueue(resolvedVhost, queueName, new RabbitQueueArgs
+            {
+                Type = RabbitQueueType.Stream,
+                Durable = durable,
+                Exclusive = false,
+                AutoDelete = autoDelete
+            });
+
+            Bind(resolvedVhost, name, queue.Name, i.ToString());
+        }
+
         return exchange;
     }
 
@@ -388,6 +414,57 @@ public sealed class ExchangeManager
         return true;
     }
 
+    public bool TryResetSuperStreamConsumerOffset(string vhost, string exchangeName, string consumerTag, RabbitStreamOffsetSpec? streamOffset, out string? error, out Dictionary<string, long> partitionOffsets)
+    {
+        error = null;
+        partitionOffsets = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+
+        if (string.IsNullOrWhiteSpace(consumerTag))
+        {
+            error = "Consumer tag is required.";
+            return false;
+        }
+
+        var resolvedVhost = NormalizeVhost(vhost);
+        if (!Exchanges.TryGetValue(ExchangeKey(resolvedVhost, exchangeName), out var exchange))
+        {
+            error = $"Exchange '{exchangeName}' does not exist.";
+            return false;
+        }
+
+        if (exchange.Type != ExchangeType.SuperStream)
+        {
+            error = $"Exchange '{exchangeName}' is not a super stream.";
+            return false;
+        }
+
+        var partitions = exchange.GetSuperStreamPartitions()
+            .Select(GetBindingDisplayName)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(static x => x, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (partitions.Length == 0)
+        {
+            error = $"Super stream '{exchangeName}' has no partitions.";
+            return false;
+        }
+
+        foreach (var partition in partitions)
+        {
+            if (!TryResetStreamConsumerOffset(resolvedVhost, partition, consumerTag, streamOffset, out var partitionError, out var nextOffset))
+            {
+                error = $"Partition '{partition}' reset failed: {partitionError}";
+                partitionOffsets.Clear();
+                return false;
+            }
+
+            partitionOffsets[partition] = nextOffset;
+        }
+
+        return true;
+    }
+
     public void CancelConsumer(string vhost, string queueName, string consumerTag)
     {
         var resolvedVhost = NormalizeVhost(vhost);
@@ -598,7 +675,11 @@ public sealed class ExchangeManager
                 vhost = exchange.Vhost,
                 name = exchange.Name,
                 type = exchange.Type.ToString(),
-                durable = exchange.Durable
+                durable = exchange.Durable,
+                super_stream_partition_count = exchange.SuperStreamPartitions,
+                super_stream_partitions = exchange.Type == ExchangeType.SuperStream
+                    ? exchange.GetSuperStreamPartitions().Select(GetBindingDisplayName).ToArray()
+                    : Array.Empty<string>()
             });
         var queues = Queues.Values
             .Where(queue => resolvedVhost == null || string.Equals(queue.Vhost, resolvedVhost, StringComparison.Ordinal))
@@ -613,6 +694,7 @@ public sealed class ExchangeManager
                 queue_type = queue.Type.ToString().ToLowerInvariant(),
                 stream_head_offset = queue.Type == RabbitQueueType.Stream ? queue.StreamHeadOffset : 0,
                 stream_tail_offset = queue.Type == RabbitQueueType.Stream ? queue.StreamTailOffset : 0,
+                stream_max_length_messages = queue.StreamMaxLengthMessages,
                 stream_max_length_bytes = queue.StreamMaxLengthBytes,
                 stream_max_age_ms = queue.StreamMaxAgeMs,
                 stream_offsets = queue.Type == RabbitQueueType.Stream
@@ -670,7 +752,8 @@ public sealed class ExchangeManager
                 exchange.Name,
                 Enum.TryParse<ExchangeType>(exchange.Type, true, out var type) ? type : ExchangeType.Direct,
                 exchange.Durable,
-                exchange.AutoDelete);
+                exchange.AutoDelete,
+                exchange.SuperStreamPartitions);
         }
 
         var queues = await _repo.GetRabbitQueuesAsync(ct);
@@ -688,6 +771,7 @@ public sealed class ExchangeManager
                 DeadLetterRoutingKey = queue.DeadLetterRoutingKey,
                 MessageTtlMs = queue.MessageTtlMs,
                 QueueTtlMs = queue.QueueTtlMs,
+                StreamMaxLengthMessages = queue.StreamMaxLengthMessages,
                 StreamMaxLengthBytes = queue.StreamMaxLengthBytes,
                 StreamMaxAgeMs = queue.StreamMaxAgeMs
             });
@@ -778,6 +862,17 @@ public sealed class ExchangeManager
     private static string QueueKey(string vhost, string name)
         => $"{NormalizeVhost(vhost)}\u001Fq\u001F{name}";
 
+    private static string GetBindingDisplayName(string bindingKey)
+    {
+        if (string.IsNullOrEmpty(bindingKey))
+            return bindingKey;
+
+        int markerIndex = bindingKey.LastIndexOf('\u001F');
+        return markerIndex >= 0 && markerIndex < bindingKey.Length - 1
+            ? bindingKey[(markerIndex + 1)..]
+            : bindingKey;
+    }
+
     private int RoutePublishToExchange(
         string vhost,
         string exchangeName,
@@ -809,7 +904,14 @@ public sealed class ExchangeManager
             return 0;
 
         var delivered = 0;
-        foreach (var destination in exchange.Route(routingKey, headers).Distinct(StringComparer.OrdinalIgnoreCase))
+        string effectiveRoutingKey = exchange.Type == ExchangeType.SuperStream &&
+                                     headers != null &&
+                                     headers.TryGetValue(SuperStreamPartitionKeyHeader, out var partitionKey) &&
+                                     !string.IsNullOrWhiteSpace(partitionKey)
+            ? partitionKey
+            : routingKey;
+
+        foreach (var destination in exchange.Route(effectiveRoutingKey, headers).Distinct(StringComparer.OrdinalIgnoreCase))
         {
             if (Queues.TryGetValue(destination, out var queue))
             {

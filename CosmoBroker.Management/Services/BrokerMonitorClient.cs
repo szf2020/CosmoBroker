@@ -82,6 +82,12 @@ public sealed class BrokerMonitorClient
     public async Task<RabbitMqStats> GetRabbitMqAsync(CancellationToken cancellationToken = default)
         => await GetAsync<RabbitMqStats>("rmqz", cancellationToken) ?? new RabbitMqStats();
 
+    public async Task<List<SuperStreamSummary>> GetSuperStreamsAsync(CancellationToken cancellationToken = default)
+        => BuildSuperStreamSummaries(await GetRabbitMqAsync(cancellationToken));
+
+    public async Task<SuperStreamSummary?> GetSuperStreamAsync(string vhost, string name, CancellationToken cancellationToken = default)
+        => FindSuperStream(await GetRabbitMqAsync(cancellationToken), vhost, name);
+
     public async Task<StreamOffsetResetResult> ResetStreamOffsetAsync(StreamOffsetResetRequest request, CancellationToken cancellationToken = default)
     {
         var relativePath =
@@ -90,6 +96,21 @@ public sealed class BrokerMonitorClient
         using var response = await _httpClient.PostAsync(relativePath, content: null, cancellationToken);
         var result = await response.Content.ReadFromJsonAsync<StreamOffsetResetResult>(cancellationToken: cancellationToken)
             ?? new StreamOffsetResetResult { ok = false, error = "Empty response from broker monitor." };
+
+        if (!response.IsSuccessStatusCode && string.IsNullOrWhiteSpace(result.error))
+            result.error = $"Broker monitor returned {(int)response.StatusCode}.";
+
+        return result;
+    }
+
+    public async Task<SuperStreamOffsetResetResult> ResetSuperStreamOffsetAsync(SuperStreamOffsetResetRequest request, CancellationToken cancellationToken = default)
+    {
+        var relativePath =
+            $"rmq/super-stream/reset?vhost={Encode(request.vhost)}&exchange={Encode(request.exchange)}&consumer={Encode(request.consumer)}&offset={Encode(request.offset)}";
+
+        using var response = await _httpClient.PostAsync(relativePath, content: null, cancellationToken);
+        var result = await response.Content.ReadFromJsonAsync<SuperStreamOffsetResetResult>(cancellationToken: cancellationToken)
+            ?? new SuperStreamOffsetResetResult { ok = false, error = "Empty response from broker monitor." };
 
         if (!response.IsSuccessStatusCode && string.IsNullOrWhiteSpace(result.error))
             result.error = $"Broker monitor returned {(int)response.StatusCode}.";
@@ -109,4 +130,86 @@ public sealed class BrokerMonitorClient
 
     private static string Encode(string? value)
         => WebUtility.UrlEncode(value ?? string.Empty);
+
+    public static List<SuperStreamSummary> BuildSuperStreamSummaries(RabbitMqStats stats)
+    {
+        if (stats.exchanges.Count == 0)
+            return [];
+
+        return stats.exchanges
+            .Where(x => string.Equals(x.type, "SuperStream", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(x => x.vhost, StringComparer.Ordinal)
+            .ThenBy(x => x.name, StringComparer.Ordinal)
+            .Select(exchange =>
+            {
+                var partitions = new HashSet<string>(exchange.super_stream_partitions, StringComparer.OrdinalIgnoreCase);
+                var partitionQueues = stats.queues
+                    .Where(q => string.Equals(q.vhost, exchange.vhost, StringComparison.Ordinal) &&
+                                q.name != null &&
+                                partitions.Contains(q.name))
+                    .ToList();
+                var partitionDetails = partitionQueues
+                    .OrderBy(q => q.name, StringComparer.Ordinal)
+                    .Select(q => new SuperStreamPartitionSummary
+                    {
+                        name = q.name ?? string.Empty,
+                        messages = q.messages,
+                        bytes = q.bytes,
+                        consumers = q.consumers,
+                        head_offset = q.stream_head_offset,
+                        tail_offset = q.stream_tail_offset,
+                        max_lag = q.stream_consumer_lag.Count == 0 ? 0 : q.stream_consumer_lag.Values.Max(),
+                        max_length_messages = q.stream_max_length_messages,
+                        max_length_bytes = q.stream_max_length_bytes,
+                        max_age_ms = q.stream_max_age_ms
+                    })
+                    .ToList();
+                var retention = partitionDetails
+                    .SelectMany(static detail => EnumerateRetention(detail))
+                    .Distinct(StringComparer.Ordinal)
+                    .OrderBy(static x => x, StringComparer.Ordinal)
+                    .ToList();
+
+                return new SuperStreamSummary
+                {
+                    vhost = exchange.vhost ?? "/",
+                    name = exchange.name ?? string.Empty,
+                    partition_count = exchange.super_stream_partition_count ?? exchange.super_stream_partitions.Count,
+                    partitions = [..exchange.super_stream_partitions],
+                    partition_details = partitionDetails,
+                    messages = partitionQueues.Sum(q => (long)q.messages),
+                    bytes = partitionQueues.Sum(q => q.bytes),
+                    consumers = partitionQueues.Sum(q => q.consumers),
+                    min_head_offset = partitionDetails.Count == 0 ? null : partitionDetails.Min(x => x.head_offset),
+                    max_tail_offset = partitionDetails.Count == 0 ? null : partitionDetails.Max(x => x.tail_offset),
+                    retention = retention,
+                    max_lag = partitionQueues
+                        .SelectMany(q => q.stream_consumer_lag.Values.DefaultIfEmpty(0))
+                        .DefaultIfEmpty(0)
+                        .Max()
+                };
+            })
+            .ToList();
+    }
+
+    public static SuperStreamSummary? FindSuperStream(RabbitMqStats stats, string? vhost, string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return null;
+
+        var resolvedVhost = string.IsNullOrWhiteSpace(vhost) ? "/" : vhost;
+        return BuildSuperStreamSummaries(stats).FirstOrDefault(x =>
+            string.Equals(x.vhost, resolvedVhost, StringComparison.Ordinal) &&
+            string.Equals(x.name, name, StringComparison.Ordinal));
+    }
+
+    private static IEnumerable<string> EnumerateRetention(SuperStreamPartitionSummary detail)
+    {
+        if (detail.max_length_messages.HasValue)
+            yield return $"max-messages {detail.max_length_messages.Value}";
+        if (detail.max_length_bytes.HasValue)
+            yield return $"max-bytes {detail.max_length_bytes.Value}";
+        if (detail.max_age_ms.HasValue)
+            yield return $"max-age-ms {detail.max_age_ms.Value}";
+    }
 }

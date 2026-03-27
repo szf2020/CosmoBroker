@@ -27,7 +27,8 @@ What works today:
 - RabbitMQ-style stream queues via `x-queue-type=stream`
 - stream offsets using `x-stream-offset = first | last | next | <numeric>`
 - persisted stream consumer resume when a repository is configured
-- basic stream retention controls with `x-max-length-bytes` and `x-max-age`
+- stream retention controls with `x-max-length`, `x-max-length-bytes`, and `x-max-age`
+- a first partitioned super-stream foundation via `x-super-stream` with `x-partitions`
 
 What is still outside current scope:
 
@@ -287,6 +288,7 @@ channel.QueueDeclare(
     arguments: new Dictionary<string, object?>
     {
         ["x-queue-type"] = "stream",
+        ["x-max-length"] = 5000L,
         ["x-max-length-bytes"] = 1024 * 1024L,
         ["x-max-age"] = "1h"
     });
@@ -318,8 +320,54 @@ Current stream notes:
 - stream queues are append-only and non-destructive
 - `basic.get` is intentionally not supported for stream queues
 - when a repository is configured, acknowledged stream consumer offsets are persisted by `consumerTag`
-- the management UI and `/api/rabbitmq` surface queue type, retention settings, bytes, and tracked stream offsets
+- stream retention currently supports count, bytes, and age trimming through queue arguments
+- the management UI and `/api/rabbitmq` surface queue type, retention settings, bytes, head/tail offsets, tracked consumer offsets, and lag
 - the management API can reset a persisted stream consumer offset through `/api/rabbitmq/streams/reset-offset`
+
+## Super Stream Foundation Example
+
+CosmoBroker also supports a first RabbitMQ-style super-stream foundation over AMQP exchange declaration arguments. This is not the dedicated RabbitMQ stream protocol. It is a partitioned stream model built on the AMQP path.
+
+```csharp
+using System.Text;
+using RabbitMQ.Client;
+
+var factory = new ConnectionFactory
+{
+    HostName = "127.0.0.1",
+    Port = 5672,
+    UserName = "guest",
+    Password = "guest"
+};
+
+using var connection = factory.CreateConnection();
+using var channel = connection.CreateModel();
+
+channel.ExchangeDeclare(
+    "orders.super",
+    "x-super-stream",
+    durable: true,
+    autoDelete: false,
+    arguments: new Dictionary<string, object?>
+    {
+        ["x-partitions"] = 4L
+    });
+
+channel.BasicPublish("orders.super", "customer-42", basicProperties: null, body: Encoding.UTF8.GetBytes("event-1"));
+channel.BasicPublish("orders.super", "customer-42", basicProperties: null, body: Encoding.UTF8.GetBytes("event-2"));
+```
+
+Current super-stream notes:
+
+- declaring `x-super-stream` auto-creates stream partitions as durable stream queues
+- publishes are routed to one partition by a stable hash of the routing key
+- publishers can override the partition hash key with the AMQP header `x-super-stream-partition-key`
+- the same routing key stays on the same partition
+- `x-partitions` is persisted and enforced on redeclare
+- the generated partition queues and logical super-stream exchange metadata are visible in `/rmqz` and the management UI
+- the management API can reset one consumer tag across every partition through `/api/rabbitmq/super-streams/reset-offset`
+- the management API exposes logical super-stream summaries through `/api/rabbitmq/super-streams`
+- this is a foundation layer, not full RabbitMQ super-stream product parity
 
 ## Compatibility Notes
 

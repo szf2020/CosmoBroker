@@ -35,7 +35,7 @@ else
         <div class="stat-card">
             <span>RabbitMQ Queues</span>
             <strong>@_snapshot.rmqz.queues.Count</strong>
-            <small>Streams: @_snapshot.rmqz.queues.Count(x => string.Equals(x.queue_type, "stream", StringComparison.OrdinalIgnoreCase)), lag: @_snapshot.rmqz.queues.Sum(MaxStreamLag)</small>
+            <small>Streams: @_snapshot.rmqz.queues.Count(x => string.Equals(x.queue_type, "stream", StringComparison.OrdinalIgnoreCase)), super streams: @GetSuperStreamSummaries().Count, lag: @_snapshot.rmqz.queues.Sum(MaxStreamLag)</small>
         </div>
         <div class="stat-card">
             <span>Routes / Leafs / Gateways</span>
@@ -118,6 +118,47 @@ else
                 </table>
             }
         </section>
+
+        <section class="panel">
+            <div class="panel-head">
+                <h2>Super Streams</h2>
+                <a href="/rabbitmq">Full view</a>
+            </div>
+            @if (GetSuperStreamSummaries().Count == 0)
+            {
+                <p class="subtle">No super streams configured.</p>
+            }
+            else
+            {
+                <table class="table table-sm">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Partitions</th>
+                            <th>Messages</th>
+                            <th>Consumers</th>
+                            <th>Max Lag</th>
+                            <th>Offsets</th>
+                            <th>Partition Detail</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var stream in GetSuperStreamSummaries().Take(5))
+                        {
+                            <tr>
+                                <td>@stream.name</td>
+                                <td>@stream.partition_count</td>
+                                <td>@stream.messages</td>
+                                <td>@stream.consumers</td>
+                                <td>@stream.max_lag</td>
+                                <td>@FormatSuperStreamOffsets(stream)</td>
+                                <td>@FormatPartitionDetail(stream)</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            }
+        </section>
     </div>
 }
 
@@ -146,4 +187,23 @@ else
 
     private static long MaxStreamLag(RabbitQueueStats queue)
         => queue.stream_consumer_lag.Count == 0 ? 0 : queue.stream_consumer_lag.Values.Max();
+
+    private List<SuperStreamSummary> GetSuperStreamSummaries()
+        => BrokerMonitorClient.BuildSuperStreamSummaries(_snapshot?.rmqz ?? new RabbitMqStats());
+
+    private static string FormatPartitionDetail(SuperStreamSummary stream)
+    {
+        if (stream.partition_details.Count == 0)
+            return "-";
+
+        return string.Join(", ", stream.partition_details.Select(p => $"{p.name}:{p.messages}/{p.max_lag}"));
+    }
+
+    private static string FormatSuperStreamOffsets(SuperStreamSummary stream)
+    {
+        if (!stream.min_head_offset.HasValue || !stream.max_tail_offset.HasValue)
+            return "-";
+
+        return $"{stream.min_head_offset.Value}..{stream.max_tail_offset.Value}";
+    }
 }

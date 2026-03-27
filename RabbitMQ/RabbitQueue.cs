@@ -36,6 +36,7 @@ public sealed class RabbitQueue
     /// <summary>x-expires — queue TTL in milliseconds (queue auto-deletes when unused).</summary>
     public int? QueueTtlMs { get; init; }
     public long? StreamMaxLengthBytes { get; init; }
+    public long? StreamMaxLengthMessages { get; init; }
     public long? StreamMaxAgeMs { get; init; }
 
     // --- State ---------------------------------------------------------------
@@ -112,6 +113,7 @@ public sealed class RabbitQueue
         MessageTtlMs = args.MessageTtlMs;
         QueueTtlMs = args.QueueTtlMs;
         StreamMaxLengthBytes = args.StreamMaxLengthBytes;
+        StreamMaxLengthMessages = args.StreamMaxLengthMessages;
         StreamMaxAgeMs = args.StreamMaxAgeMs;
 
         if (Type == RabbitQueueType.Stream)
@@ -870,6 +872,9 @@ public sealed class RabbitQueue
                     remove = true;
             }
 
+            if (!remove && StreamMaxLengthMessages.HasValue && _stream.Count > StreamMaxLengthMessages.Value)
+                remove = true;
+
             if (!remove && StreamMaxLengthBytes.HasValue && _streamBytes > StreamMaxLengthBytes.Value)
                 remove = true;
 
@@ -938,5 +943,6 @@ public sealed class RabbitQueueArgs
     public int? MessageTtlMs { get; set; }
     public int? QueueTtlMs { get; set; }
     public long? StreamMaxLengthBytes { get; set; }
+    public long? StreamMaxLengthMessages { get; set; }
     public long? StreamMaxAgeMs { get; set; }
 }

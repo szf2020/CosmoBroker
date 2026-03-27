@@ -53,11 +53,16 @@ Currently covered in the native AMQP path:
 - exclusive queues and exclusive consumers
 - mandatory publish returns
 - durable queues and durable messages when a repository is configured
+- stream queues via `x-queue-type=stream`
+- stream replay offsets via `x-stream-offset`
+- stream retention via `x-max-length`, `x-max-length-bytes`, and `x-max-age`
+- persisted stream consumer resume and management-visible stream lag
+- a first partitioned stream foundation via `x-super-stream` with `x-partitions`
 
 Current RabbitMQ gap areas are mostly advanced product features rather than core AMQP correctness:
 
 - quorum queues
-- streams parity with RabbitMQ streams
+- full RabbitMQ streams parity beyond the current AMQP stream and super-stream foundation
 - policies / operator policies
 - clustering and replication parity with RabbitMQ
 - plugin ecosystem parity

@@ -191,7 +191,7 @@ internal sealed class AmqpConnection : IAsyncDisposable
                 _ = ReadBit(ref payload, 3);
                 _ = ReadBit(ref payload, 4);
                 bool exchangeDeclareNoWait = ReadBit(ref payload, 5);
-                _ = ReadBit(ref payload, 6);
+                var exchangeArgs = AmqpWire.ReadTable(ref payload);
                 if (passive)
                 {
                     if (!_manager.HasExchange(_vhost, exchangeName))
@@ -209,18 +209,38 @@ internal sealed class AmqpConnection : IAsyncDisposable
                     }
 
                     var existingExchange = _manager.GetExchange(_vhost, exchangeName);
+                    var declaredType = ParseExchangeType(exchangeType);
+                    int? declaredSuperPartitions = declaredType == ExchangeType.SuperStream
+                        ? (int?)(GetLongArg(exchangeArgs, "x-partitions") ?? 0)
+                        : null;
                     if (existingExchange != null &&
-                        (existingExchange.Type != (Enum.TryParse<ExchangeType>(exchangeType, true, out var parsedType) ? parsedType : ExchangeType.Direct) ||
+                        (existingExchange.Type != declaredType ||
                          existingExchange.Durable != durable ||
-                         existingExchange.AutoDelete != autoDelete))
+                         existingExchange.AutoDelete != autoDelete ||
+                         (declaredType == ExchangeType.SuperStream &&
+                          existingExchange.SuperStreamPartitions != declaredSuperPartitions)))
                     {
                         await SendChannelCloseAsync(channelNumber, 406, $"Exchange '{exchangeName}' redeclared with different properties", classId, methodId, ct);
                         return;
                     }
-                    var type = Enum.TryParse<ExchangeType>(exchangeType, true, out var parsed) ? parsed : ExchangeType.Direct;
+                    var type = declaredType;
                     try
                     {
-                        _manager.DeclareExchange(_vhost, exchangeName, type, durable, autoDelete);
+                        if (type == ExchangeType.SuperStream)
+                        {
+                            int partitions = declaredSuperPartitions ?? 0;
+                            if (partitions <= 0)
+                            {
+                                await SendChannelCloseAsync(channelNumber, 406, $"Super stream '{exchangeName}' requires x-partitions > 0", classId, methodId, ct);
+                                return;
+                            }
+
+                            _manager.DeclareSuperStream(_vhost, exchangeName, partitions, durable, autoDelete);
+                        }
+                        else
+                        {
+                            _manager.DeclareExchange(_vhost, exchangeName, type, durable, autoDelete);
+                        }
                     }
                     catch (InvalidOperationException ex)
                     {
@@ -380,6 +400,7 @@ internal sealed class AmqpConnection : IAsyncDisposable
                          !string.Equals(existingQueue.DeadLetterRoutingKey, GetStringArg(arguments, "x-dead-letter-routing-key"), StringComparison.Ordinal) ||
                          existingQueue.MessageTtlMs != GetIntArg(arguments, "x-message-ttl") ||
                          existingQueue.QueueTtlMs != GetIntArg(arguments, "x-expires") ||
+                         existingQueue.StreamMaxLengthMessages != GetLongArg(arguments, "x-max-length") ||
                          existingQueue.StreamMaxLengthBytes != GetLongArg(arguments, "x-max-length-bytes") ||
                          existingQueue.StreamMaxAgeMs != ParseDurationMs(GetStringArg(arguments, "x-max-age"))))
                     {
@@ -399,6 +420,7 @@ internal sealed class AmqpConnection : IAsyncDisposable
                             DeadLetterRoutingKey = GetStringArg(arguments, "x-dead-letter-routing-key"),
                             MessageTtlMs = GetIntArg(arguments, "x-message-ttl"),
                             QueueTtlMs = GetIntArg(arguments, "x-expires"),
+                            StreamMaxLengthMessages = GetLongArg(arguments, "x-max-length"),
                             StreamMaxLengthBytes = GetLongArg(arguments, "x-max-length-bytes"),
                             StreamMaxAgeMs = ParseDurationMs(GetStringArg(arguments, "x-max-age"))
                         }, _sessionId);
@@ -1271,6 +1293,11 @@ internal sealed class AmqpConnection : IAsyncDisposable
         => string.Equals(value, "stream", StringComparison.OrdinalIgnoreCase)
             ? RabbitQueueType.Stream
             : RabbitQueueType.Classic;
+
+    private static ExchangeType ParseExchangeType(string? value)
+        => string.Equals(value, "x-super-stream", StringComparison.OrdinalIgnoreCase)
+            ? ExchangeType.SuperStream
+            : Enum.TryParse<ExchangeType>(value, true, out var parsed) ? parsed : ExchangeType.Direct;
 
     private static RabbitStreamOffsetSpec? ParseStreamOffset(object? value)
     {

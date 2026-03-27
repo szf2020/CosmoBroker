@@ -140,6 +140,43 @@ public class MonitoringService
                     }
                 }
             }
+            else if (string.Equals(method, "POST", StringComparison.OrdinalIgnoreCase) && path == "/rmq/super-stream/reset")
+            {
+                string vhost = query.TryGetValue("vhost", out var vhostValue) && !string.IsNullOrWhiteSpace(vhostValue)
+                    ? vhostValue
+                    : "/";
+                string exchange = query.TryGetValue("exchange", out var exchangeValue) ? exchangeValue : string.Empty;
+                string consumer = query.TryGetValue("consumer", out var consumerValue) ? consumerValue : string.Empty;
+                string? offsetText = query.TryGetValue("offset", out var offsetValue) ? offsetValue : null;
+
+                if (string.IsNullOrWhiteSpace(exchange) || string.IsNullOrWhiteSpace(consumer))
+                {
+                    statusCode = 400;
+                    reasonPhrase = "Bad Request";
+                    responseData = new { ok = false, error = "Exchange and consumer are required." };
+                }
+                else
+                {
+                    var streamOffset = ParseStreamOffset(offsetText);
+                    if (_server.TryResetRabbitSuperStreamOffset(vhost, exchange, consumer, streamOffset, out var error, out var partitions))
+                    {
+                        responseData = new
+                        {
+                            ok = true,
+                            vhost,
+                            exchange,
+                            consumer,
+                            partitions
+                        };
+                    }
+                    else
+                    {
+                        statusCode = 400;
+                        reasonPhrase = "Bad Request";
+                        responseData = new { ok = false, error = error ?? "Unable to reset super stream offsets." };
+                    }
+                }
+            }
             else
             {
                 responseData = new { error = "Not Found", paths = new[] { "/varz", "/connz", "/routez", "/leafz", "/gatewayz", "/jsz", "/rmqz" } };

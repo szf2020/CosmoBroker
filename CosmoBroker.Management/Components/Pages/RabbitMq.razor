@@ -17,6 +17,8 @@
 }
 else
 {
+    var selectedSuperStream = GetSelectedSuperStream();
+
     <div class="stats-grid two">
         <div class="stat-card">
             <span>Exchanges</span>
@@ -59,7 +61,148 @@ else
         </form>
     </section>
 
+    <section class="panel">
+        <div class="panel-head">
+            <h2>Reset Super Stream Consumer Offset</h2>
+        </div>
+        <form method="post" action="/rabbitmq/super-streams/reset-offset" class="stream-reset-form">
+            <div class="row g-2">
+                <div class="col-md-2">
+                    <label class="form-label" for="super-vhost">Vhost</label>
+                    <input id="super-vhost" class="form-control" type="text" name="super-vhost" value="/" />
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label" for="super-exchange">Exchange</label>
+                    <input id="super-exchange" class="form-control" type="text" name="super-exchange" placeholder="super stream exchange" />
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label" for="super-consumer">Consumer</label>
+                    <input id="super-consumer" class="form-control" type="text" name="super-consumer" placeholder="consumer tag" />
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label" for="super-offset">Offset</label>
+                    <input id="super-offset" class="form-control" type="text" name="super-offset" value="first" />
+                </div>
+                <div class="col-md-2 d-flex align-items-end">
+                    <button type="submit" class="btn btn-primary w-100">Reset All</button>
+                </div>
+            </div>
+            <div class="form-text">Resets the same consumer tag across all partitions of a super stream.</div>
+        </form>
+    </section>
+
     <div class="panel-grid">
+        @if (selectedSuperStream != null)
+        {
+            <section class="panel">
+                <div class="panel-head">
+                    <h2>Selected Super Stream</h2>
+                    <a href="/rabbitmq">Clear</a>
+                </div>
+                <table class="table table-striped">
+                    <thead>
+                        <tr>
+                            <th>Vhost</th>
+                            <th>Name</th>
+                            <th>Partitions</th>
+                            <th>Messages</th>
+                            <th>Bytes</th>
+                            <th>Consumers</th>
+                            <th>Max Lag</th>
+                            <th>Offsets</th>
+                            <th>Retention</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>@selectedSuperStream.vhost</td>
+                            <td>@selectedSuperStream.name</td>
+                            <td>@selectedSuperStream.partition_count</td>
+                            <td>@selectedSuperStream.messages</td>
+                            <td>@FormatBytes(selectedSuperStream.bytes)</td>
+                            <td>@selectedSuperStream.consumers</td>
+                            <td>@selectedSuperStream.max_lag</td>
+                            <td>@FormatSuperStreamOffsetRange(selectedSuperStream)</td>
+                            <td>@FormatSuperStreamRetention(selectedSuperStream)</td>
+                        </tr>
+                    </tbody>
+                </table>
+                <table class="table table-striped">
+                    <thead>
+                        <tr>
+                            <th>Partition</th>
+                            <th>Messages</th>
+                            <th>Bytes</th>
+                            <th>Consumers</th>
+                            <th>Offsets</th>
+                            <th>Max Lag</th>
+                            <th>Retention</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var partition in selectedSuperStream.partition_details)
+                        {
+                            <tr>
+                                <td>@partition.name</td>
+                                <td>@partition.messages</td>
+                                <td>@FormatBytes(partition.bytes)</td>
+                                <td>@partition.consumers</td>
+                                <td>@($"{partition.head_offset}..{partition.tail_offset}")</td>
+                                <td>@partition.max_lag</td>
+                                <td>@FormatPartitionRetention(partition)</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </section>
+        }
+
+        <section class="panel">
+            <div class="panel-head">
+                <h2>Super Streams</h2>
+            </div>
+            @if (GetSuperStreamSummaries().Count == 0)
+            {
+                <p class="subtle">No super streams.</p>
+            }
+            else
+            {
+                <table class="table table-striped">
+                    <thead>
+                        <tr>
+                            <th>Vhost</th>
+                            <th>Name</th>
+                            <th>Partitions</th>
+                            <th>Messages</th>
+                            <th>Bytes</th>
+                            <th>Consumers</th>
+                            <th>Max Lag</th>
+                            <th>Offset Range</th>
+                            <th>Retention</th>
+                            <th>Partition Detail</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var stream in GetSuperStreamSummaries())
+                        {
+                            <tr>
+                                <td>@stream.vhost</td>
+                                <td><a href="@GetSuperStreamLink(stream)">@stream.name</a></td>
+                                <td>@stream.partition_count</td>
+                                <td>@stream.messages</td>
+                                <td>@FormatBytes(stream.bytes)</td>
+                                <td>@stream.consumers</td>
+                                <td>@stream.max_lag</td>
+                                <td>@FormatSuperStreamOffsetRange(stream)</td>
+                                <td>@FormatSuperStreamRetention(stream)</td>
+                                <td>@FormatSuperStreamPartitionDetail(stream)</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            }
+        </section>
+
         <section class="panel">
             <div class="panel-head">
                 <h2>Queues</h2>
@@ -128,6 +271,7 @@ else
                             <th>Vhost</th>
                             <th>Name</th>
                             <th>Type</th>
+                            <th>Partitions</th>
                             <th>Durable</th>
                         </tr>
                     </thead>
@@ -138,6 +282,7 @@ else
                                 <td>@exchange.vhost</td>
                                 <td>@exchange.name</td>
                                 <td>@exchange.type</td>
+                                <td>@FormatExchangePartitions(exchange)</td>
                                 <td>@(exchange.durable ? "yes" : "no")</td>
                             </tr>
                         }
@@ -184,6 +329,8 @@ else
             return "-";
 
         var parts = new List<string>();
+        if (queue.stream_max_length_messages.HasValue)
+            parts.Add($"max-messages {queue.stream_max_length_messages.Value}");
         if (queue.stream_max_length_bytes.HasValue)
             parts.Add($"max-bytes {FormatBytes(queue.stream_max_length_bytes.Value)}");
         if (queue.stream_max_age_ms.HasValue)
@@ -218,5 +365,68 @@ else
         return string.Join(", ", queue.stream_offsets
             .OrderBy(x => x.Key, StringComparer.Ordinal)
             .Select(x => $"{x.Key}:{x.Value}"));
+    }
+
+    private static string FormatExchangePartitions(RabbitExchangeStats exchange)
+    {
+        if (!string.Equals(exchange.type, "SuperStream", StringComparison.OrdinalIgnoreCase) ||
+            exchange.super_stream_partitions.Count == 0)
+            return "-";
+
+        return string.Join(", ", exchange.super_stream_partitions);
+    }
+
+    private List<SuperStreamSummary> GetSuperStreamSummaries()
+        => _rabbitMq == null ? [] : BrokerMonitorClient.BuildSuperStreamSummaries(_rabbitMq);
+
+    private SuperStreamSummary? GetSelectedSuperStream()
+    {
+        if (_rabbitMq == null)
+            return null;
+
+        var name = HttpContext.Request.Query.TryGetValue("super", out var superValue) ? superValue : null;
+        var vhost = HttpContext.Request.Query.TryGetValue("vhost", out var vhostValue) && !string.IsNullOrWhiteSpace(vhostValue) ? vhostValue : "/";
+        return BrokerMonitorClient.FindSuperStream(_rabbitMq, vhost, name);
+    }
+
+    private static string GetSuperStreamLink(SuperStreamSummary stream)
+        => $"/rabbitmq?super={Uri.EscapeDataString(stream.name)}&vhost={Uri.EscapeDataString(stream.vhost)}";
+
+    private static string FormatSuperStreamPartitionDetail(SuperStreamSummary stream)
+    {
+        if (stream.partition_details.Count == 0)
+            return "-";
+
+        return string.Join(", ", stream.partition_details.Select(p =>
+            $"{p.name}:{p.messages} msg,{p.consumers} c,lag {p.max_lag}"));
+    }
+
+    private static string FormatSuperStreamOffsetRange(SuperStreamSummary stream)
+    {
+        if (!stream.min_head_offset.HasValue || !stream.max_tail_offset.HasValue)
+            return "-";
+
+        return $"{stream.min_head_offset.Value}..{stream.max_tail_offset.Value}";
+    }
+
+    private static string FormatSuperStreamRetention(SuperStreamSummary stream)
+    {
+        if (stream.retention.Count == 0)
+            return "unbounded";
+
+        return string.Join(", ", stream.retention);
+    }
+
+    private static string FormatPartitionRetention(SuperStreamPartitionSummary partition)
+    {
+        var parts = new List<string>();
+        if (partition.max_length_messages.HasValue)
+            parts.Add($"max-messages {partition.max_length_messages.Value}");
+        if (partition.max_length_bytes.HasValue)
+            parts.Add($"max-bytes {FormatBytes(partition.max_length_bytes.Value)}");
+        if (partition.max_age_ms.HasValue)
+            parts.Add($"max-age {TimeSpan.FromMilliseconds(partition.max_age_ms.Value):g}");
+
+        return parts.Count == 0 ? "unbounded" : string.Join(", ", parts);
     }
 }

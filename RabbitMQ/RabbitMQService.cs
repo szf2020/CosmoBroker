@@ -129,6 +129,7 @@ public sealed class RabbitMQService
                     MessageTtlMs = request.MessageTtlMs,
                     QueueTtlMs = request.QueueTtlMs,
                     StreamMaxLengthBytes = request.StreamMaxLengthBytes,
+                    StreamMaxLengthMessages = request.StreamMaxLengthMessages,
                     StreamMaxAgeMs = ParseDurationMs(request.StreamMaxAge)
                 };
                 var queue = _mgr.DeclareQueue(vhost, queueName, args);
@@ -527,6 +528,7 @@ public sealed class RabbitMQService
         public int? MessageTtlMs { get; set; }
         public int? QueueTtlMs { get; set; }
         public long? StreamMaxLengthBytes { get; set; }
+        public long? StreamMaxLengthMessages { get; set; }
         public string? StreamMaxAge { get; set; }
     }
 
