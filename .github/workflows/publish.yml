@@ -137,3 +137,16 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/cosmobroker-management:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Build and push combined broker-management image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/combined/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/cosmobroker-server-management:${{ steps.version.outputs.tag }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/cosmobroker-server-management:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

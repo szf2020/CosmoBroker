@@ -151,6 +151,23 @@ docker run --rm -p 4222:4222 -p 8222:8222 -p 5672:5672 \
   your-dockerhub-user/cosmobroker-server:latest
 ```
 
+If you want a single RabbitMQ-style image that includes both the broker and the management UI, use:
+
+```bash
+docker run --rm -p 4222:4222 -p 8222:8222 -p 5672:5672 -p 9091:9091 \
+  -e COSMOBROKER_ENABLE_NATS=true \
+  -e COSMOBROKER_ENABLE_AMQP=true \
+  -e COSMOBROKER_AMQP_PORT=5672 \
+  your-dockerhub-user/cosmobroker-server-management:latest
+```
+
+That combined image starts:
+
+- the broker on `4222`
+- the monitor endpoint on `8222`
+- the optional AMQP listener on `5672`
+- the management UI on `9091`
+
 ### Runtime Environment Variables
 
 | Variable | Purpose |

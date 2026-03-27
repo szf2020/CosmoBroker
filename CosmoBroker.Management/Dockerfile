@@ -4,7 +4,7 @@ WORKDIR /src
 
 # Copy project files first for layer-cached restore
 COPY CosmoBroker.Management/CosmoBroker.Management.csproj CosmoBroker.Management/
-COPY CosmoApiServer /Users/kutty/dev/CosmoApiServer
+COPY CosmoApiServer /CosmoApiServer
 
 RUN dotnet restore CosmoBroker.Management/CosmoBroker.Management.csproj
 
