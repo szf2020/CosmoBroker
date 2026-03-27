@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\CosmoBroker.csproj" />
+    <ProjectReference Include="..\CosmoBroker.Management\CosmoBroker.Management.csproj" />
   </ItemGroup>
 
   <ItemGroup>

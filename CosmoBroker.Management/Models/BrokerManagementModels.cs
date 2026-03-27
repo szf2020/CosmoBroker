@@ -112,10 +112,12 @@ public sealed class SuperStreamSummary
     public long messages { get; set; }
     public long bytes { get; set; }
     public int consumers { get; set; }
+    public int logical_consumers { get; set; }
     public long max_lag { get; set; }
     public long? min_head_offset { get; set; }
     public long? max_tail_offset { get; set; }
     public List<string> retention { get; set; } = [];
+    public List<SuperStreamConsumerSummary> consumer_details { get; set; } = [];
 }
 
 public sealed class SuperStreamPartitionSummary
@@ -130,6 +132,24 @@ public sealed class SuperStreamPartitionSummary
     public long? max_length_messages { get; set; }
     public long? max_length_bytes { get; set; }
     public long? max_age_ms { get; set; }
+}
+
+public sealed class SuperStreamConsumerSummary
+{
+    public string consumer { get; set; } = string.Empty;
+    public int partition_count { get; set; }
+    public long total_lag { get; set; }
+    public long max_lag { get; set; }
+    public long? min_next_offset { get; set; }
+    public long? max_next_offset { get; set; }
+    public List<SuperStreamConsumerPartitionSummary> partition_details { get; set; } = [];
+}
+
+public sealed class SuperStreamConsumerPartitionSummary
+{
+    public string partition { get; set; } = string.Empty;
+    public long next_offset { get; set; }
+    public long lag { get; set; }
 }
 
 public sealed class StreamOffsetResetRequest
@@ -166,6 +186,25 @@ public sealed class SuperStreamOffsetResetResult
     public string exchange { get; set; } = string.Empty;
     public string consumer { get; set; } = string.Empty;
     public Dictionary<string, long> partitions { get; set; } = [];
+}
+
+public sealed class SuperStreamRoutePreviewRequest
+{
+    public string vhost { get; set; } = "/";
+    public string exchange { get; set; } = string.Empty;
+    public string routing_key { get; set; } = string.Empty;
+    public string? partition_key { get; set; }
+}
+
+public sealed class SuperStreamRoutePreviewResult
+{
+    public bool ok { get; set; }
+    public string? error { get; set; }
+    public string vhost { get; set; } = "/";
+    public string exchange { get; set; } = string.Empty;
+    public string routing_key { get; set; } = string.Empty;
+    public string? partition_key { get; set; }
+    public string? partition { get; set; }
 }
 
 public sealed class RabbitExchangeStats

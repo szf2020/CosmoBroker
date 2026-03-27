@@ -597,6 +597,82 @@ public class RabbitMQTests : IAsyncDisposable
         Assert.Null(secondConsumer);
     }
 
+    [Fact]
+    public async Task ExchangeDeclare_SuperStream_ShouldCreatePartitionStreamsViaRmqApi()
+    {
+        var client = await ConnectedClientAsync();
+
+        using var declare = await RmqRequestAsync(client, "$RMQ.EXCHANGE.DECLARE", new
+        {
+            name = "orders.super.api",
+            type = "x-super-stream",
+            durable = true,
+            superStreamPartitions = 2,
+            streamMaxLengthMessages = 50L,
+            streamMaxLengthBytes = 1024L,
+            streamMaxAge = "2s"
+        });
+
+        Assert.True(declare.RootElement.GetProperty("ok").GetBoolean());
+        var declareResult = declare.RootElement.GetProperty("result");
+        Assert.Equal("SuperStream", declareResult.GetProperty("type").GetString());
+        Assert.Equal(2, declareResult.GetProperty("super_stream_partition_count").GetInt32());
+
+        using var stats = await RmqRequestAsync(client, "$RMQ.STATS", new { });
+        Assert.True(stats.RootElement.GetProperty("ok").GetBoolean());
+        var result = stats.RootElement.GetProperty("result");
+
+        var exchange = result.GetProperty("exchanges").EnumerateArray()
+            .FirstOrDefault(x => x.TryGetProperty("name", out var name) && name.GetString() == "orders.super.api");
+        Assert.True(exchange.ValueKind != JsonValueKind.Undefined);
+        Assert.Equal("SuperStream", exchange.GetProperty("type").GetString());
+        Assert.Equal(2, exchange.GetProperty("super_stream_partition_count").GetInt32());
+
+        var queues = result.GetProperty("queues").EnumerateArray()
+            .Where(x => x.GetProperty("name").GetString() is "orders.super.api-0" or "orders.super.api-1")
+            .ToList();
+        Assert.Equal(2, queues.Count);
+        foreach (var queue in queues)
+        {
+            Assert.Equal("stream", queue.GetProperty("queue_type").GetString());
+            Assert.Equal(50L, queue.GetProperty("stream_max_length_messages").GetInt64());
+            Assert.Equal(1024L, queue.GetProperty("stream_max_length_bytes").GetInt64());
+            Assert.Equal(2000L, queue.GetProperty("stream_max_age_ms").GetInt64());
+        }
+    }
+
+    [Fact]
+    public async Task ExchangeDeclare_SuperStream_ShouldRejectRedeclareWithDifferentRetentionViaRmqApi()
+    {
+        var client = await ConnectedClientAsync();
+
+        using var declare = await RmqRequestAsync(client, "$RMQ.EXCHANGE.DECLARE", new
+        {
+            name = "orders.super.precondition.api",
+            type = "x-super-stream",
+            durable = true,
+            superStreamPartitions = 2,
+            streamMaxLengthMessages = 50L,
+            streamMaxLengthBytes = 1024L,
+            streamMaxAge = "2s"
+        });
+        Assert.True(declare.RootElement.GetProperty("ok").GetBoolean());
+
+        using var mismatch = await RmqRequestAsync(client, "$RMQ.EXCHANGE.DECLARE", new
+        {
+            name = "orders.super.precondition.api",
+            type = "x-super-stream",
+            durable = true,
+            superStreamPartitions = 2,
+            streamMaxLengthMessages = 51L,
+            streamMaxLengthBytes = 1024L,
+            streamMaxAge = "2s"
+        });
+
+        Assert.False(mismatch.RootElement.GetProperty("ok").GetBoolean());
+        Assert.Contains("different properties", mismatch.RootElement.GetProperty("error").GetString(), StringComparison.OrdinalIgnoreCase);
+    }
+
     public async ValueTask DisposeAsync()
     {
         _cts.Cancel();

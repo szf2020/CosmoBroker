@@ -118,6 +118,21 @@ public sealed class BrokerMonitorClient
         return result;
     }
 
+    public async Task<SuperStreamRoutePreviewResult> PreviewSuperStreamRouteAsync(SuperStreamRoutePreviewRequest request, CancellationToken cancellationToken = default)
+    {
+        var relativePath =
+            $"rmq/super-stream/route?vhost={Encode(request.vhost)}&exchange={Encode(request.exchange)}&routing_key={Encode(request.routing_key)}&partition_key={Encode(request.partition_key)}";
+
+        using var response = await _httpClient.GetAsync(relativePath, cancellationToken);
+        var result = await response.Content.ReadFromJsonAsync<SuperStreamRoutePreviewResult>(cancellationToken: cancellationToken)
+            ?? new SuperStreamRoutePreviewResult { ok = false, error = "Empty response from broker monitor." };
+
+        if (!response.IsSuccessStatusCode && string.IsNullOrWhiteSpace(result.error))
+            result.error = $"Broker monitor returned {(int)response.StatusCode}.";
+
+        return result;
+    }
+
     private async Task<T?> GetAsync<T>(string relativePath, CancellationToken cancellationToken)
     {
         using var response = await _httpClient.GetAsync(relativePath, cancellationToken);
@@ -164,6 +179,35 @@ public sealed class BrokerMonitorClient
                         max_age_ms = q.stream_max_age_ms
                     })
                     .ToList();
+                var consumerDetails = partitionQueues
+                    .SelectMany(queue => queue.stream_offsets.Select(offset => new
+                    {
+                        consumer = offset.Key,
+                        partition = queue.name ?? string.Empty,
+                        next_offset = offset.Value,
+                        lag = queue.stream_consumer_lag.TryGetValue(offset.Key, out var lag) ? lag : 0L
+                    }))
+                    .GroupBy(x => x.consumer, StringComparer.Ordinal)
+                    .OrderBy(x => x.Key, StringComparer.Ordinal)
+                    .Select(group => new SuperStreamConsumerSummary
+                    {
+                        consumer = group.Key,
+                        partition_count = group.Count(),
+                        total_lag = group.Sum(x => x.lag),
+                        max_lag = group.Max(x => x.lag),
+                        min_next_offset = group.Min(x => x.next_offset),
+                        max_next_offset = group.Max(x => x.next_offset),
+                        partition_details = group
+                            .OrderBy(x => x.partition, StringComparer.Ordinal)
+                            .Select(x => new SuperStreamConsumerPartitionSummary
+                            {
+                                partition = x.partition,
+                                next_offset = x.next_offset,
+                                lag = x.lag
+                            })
+                            .ToList()
+                    })
+                    .ToList();
                 var retention = partitionDetails
                     .SelectMany(static detail => EnumerateRetention(detail))
                     .Distinct(StringComparer.Ordinal)
@@ -180,9 +224,11 @@ public sealed class BrokerMonitorClient
                     messages = partitionQueues.Sum(q => (long)q.messages),
                     bytes = partitionQueues.Sum(q => q.bytes),
                     consumers = partitionQueues.Sum(q => q.consumers),
+                    logical_consumers = consumerDetails.Count,
                     min_head_offset = partitionDetails.Count == 0 ? null : partitionDetails.Min(x => x.head_offset),
                     max_tail_offset = partitionDetails.Count == 0 ? null : partitionDetails.Max(x => x.tail_offset),
                     retention = retention,
+                    consumer_details = consumerDetails,
                     max_lag = partitionQueues
                         .SelectMany(q => q.stream_consumer_lag.Values.DefaultIfEmpty(0))
                         .DefaultIfEmpty(0)

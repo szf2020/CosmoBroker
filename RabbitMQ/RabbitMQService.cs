@@ -78,9 +78,49 @@ public sealed class RabbitMQService
                 if (!CanConfigure(account, vhost, $"exchange:{exchangeName}"))
                     return Error($"Access denied to configure exchange '{exchangeName}' in vhost '{vhost}'");
 
-                var type = Enum.TryParse<ExchangeType>(request.Type ?? "Direct", true, out var et) ? et : ExchangeType.Direct;
-                var exchange = _mgr.DeclareExchange(vhost, exchangeName, type, request.Durable, request.AutoDelete);
-                return Ok(new { vhost, exchange = exchange.Name, type = exchange.Type.ToString(), durable = exchange.Durable });
+                var type = ParseExchangeType(request.Type);
+                var existingExchange = _mgr.GetExchange(vhost, exchangeName);
+                var requestedSuperMaxLengthMessages = type == ExchangeType.SuperStream ? request.StreamMaxLengthMessages : null;
+                var requestedSuperMaxLengthBytes = type == ExchangeType.SuperStream ? request.StreamMaxLengthBytes : null;
+                var requestedSuperMaxAgeMs = type == ExchangeType.SuperStream ? ParseDurationMs(request.StreamMaxAge) : null;
+                if (existingExchange != null &&
+                    (existingExchange.Type != type ||
+                     existingExchange.Durable != request.Durable ||
+                     existingExchange.AutoDelete != request.AutoDelete ||
+                     (type == ExchangeType.SuperStream &&
+                      (existingExchange.SuperStreamPartitions != request.SuperStreamPartitions ||
+                       !SuperStreamRetentionMatches(vhost, exchangeName, requestedSuperMaxLengthMessages, requestedSuperMaxLengthBytes, requestedSuperMaxAgeMs)))))
+                {
+                    return Error($"Exchange '{exchangeName}' redeclared with different properties");
+                }
+
+                Exchange exchange;
+                if (type == ExchangeType.SuperStream)
+                {
+                    int partitions = request.SuperStreamPartitions ?? 0;
+                    if (partitions <= 0)
+                        return Error("Super stream partitions must be greater than zero.");
+
+                    exchange = _mgr.DeclareSuperStream(vhost, exchangeName, partitions, request.Durable, request.AutoDelete, new RabbitQueueArgs
+                    {
+                        StreamMaxLengthMessages = requestedSuperMaxLengthMessages,
+                        StreamMaxLengthBytes = requestedSuperMaxLengthBytes,
+                        StreamMaxAgeMs = requestedSuperMaxAgeMs
+                    });
+                }
+                else
+                {
+                    exchange = _mgr.DeclareExchange(vhost, exchangeName, type, request.Durable, request.AutoDelete);
+                }
+
+                return Ok(new
+                {
+                    vhost,
+                    exchange = exchange.Name,
+                    type = exchange.Type.ToString(),
+                    durable = exchange.Durable,
+                    super_stream_partition_count = exchange.SuperStreamPartitions
+                });
             }
             case "DELETE":
             {
@@ -513,6 +553,10 @@ public sealed class RabbitMQService
         public string? Type { get; set; }
         public bool Durable { get; set; } = true;
         public bool AutoDelete { get; set; }
+        public int? SuperStreamPartitions { get; set; }
+        public long? StreamMaxLengthBytes { get; set; }
+        public long? StreamMaxLengthMessages { get; set; }
+        public string? StreamMaxAge { get; set; }
     }
 
     private sealed class QueueDeclareRequest : VhostRequest
@@ -603,6 +647,22 @@ public sealed class RabbitMQService
             "next" => new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Next },
             _ => null
         };
+    }
+
+    private static ExchangeType ParseExchangeType(string? value)
+        => string.Equals(value, "x-super-stream", StringComparison.OrdinalIgnoreCase)
+            ? ExchangeType.SuperStream
+            : Enum.TryParse<ExchangeType>(value, true, out var parsed) ? parsed : ExchangeType.Direct;
+
+    private bool SuperStreamRetentionMatches(string vhost, string exchangeName, long? maxLengthMessages, long? maxLengthBytes, long? maxAgeMs)
+    {
+        var firstPartition = _mgr.GetQueue(vhost, $"{exchangeName}-0");
+        if (firstPartition == null)
+            return maxLengthMessages == null && maxLengthBytes == null && maxAgeMs == null;
+
+        return firstPartition.StreamMaxLengthMessages == maxLengthMessages &&
+               firstPartition.StreamMaxLengthBytes == maxLengthBytes &&
+               firstPartition.StreamMaxAgeMs == maxAgeMs;
     }
 
     private static long? ParseDurationMs(string? value)

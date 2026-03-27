@@ -29,6 +29,8 @@ What works today:
 - persisted stream consumer resume when a repository is configured
 - stream retention controls with `x-max-length`, `x-max-length-bytes`, and `x-max-age`
 - a first partitioned super-stream foundation via `x-super-stream` with `x-partitions`
+- super-stream partition retention propagation through `x-max-length`, `x-max-length-bytes`, and `x-max-age`
+- logical super-stream management summaries with partition and consumer-state visibility
 
 What is still outside current scope:
 

@@ -124,17 +124,9 @@ public sealed class Exchange
 
     private IEnumerable<string> RouteSuperStream(string routingKey)
     {
-        var partitions = _bindings
-            .SelectMany(x => x.Value)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-
-        if (partitions.Length == 0)
-            yield break;
-
-        int index = GetStableHash(routingKey) % partitions.Length;
-        yield return partitions[index];
+        var partition = ResolveSuperStreamPartition(routingKey);
+        if (!string.IsNullOrWhiteSpace(partition))
+            yield return partition;
     }
 
     // --- Topic pattern matching (RabbitMQ semantics: * = one word, # = zero or more) ---
@@ -201,6 +193,19 @@ public sealed class Exchange
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(static x => x, StringComparer.OrdinalIgnoreCase)
             .ToArray();
+    }
+
+    public string? ResolveSuperStreamPartition(string routingKey)
+    {
+        if (Type != ExchangeType.SuperStream)
+            return null;
+
+        var partitions = GetSuperStreamPartitions();
+        if (partitions.Count == 0)
+            return null;
+
+        int index = GetStableHash(routingKey) % partitions.Count;
+        return partitions[index];
     }
 
     public bool HasBindings()

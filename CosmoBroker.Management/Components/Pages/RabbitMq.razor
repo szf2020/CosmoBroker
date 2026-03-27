@@ -91,6 +91,36 @@ else
         </form>
     </section>
 
+    <section class="panel">
+        <div class="panel-head">
+            <h2>Preview Super Stream Route</h2>
+        </div>
+        <form method="post" action="/rabbitmq/super-streams/route-preview" class="stream-reset-form">
+            <div class="row g-2">
+                <div class="col-md-2">
+                    <label class="form-label" for="route-vhost">Vhost</label>
+                    <input id="route-vhost" class="form-control" type="text" name="route-vhost" value="@(selectedSuperStream?.vhost ?? "/")" />
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label" for="route-exchange">Exchange</label>
+                    <input id="route-exchange" class="form-control" type="text" name="route-exchange" value="@(selectedSuperStream?.name ?? string.Empty)" placeholder="super stream exchange" />
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label" for="route-routing-key">Routing Key</label>
+                    <input id="route-routing-key" class="form-control" type="text" name="route-routing-key" placeholder="routing key" />
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label" for="route-partition-key">Partition Key</label>
+                    <input id="route-partition-key" class="form-control" type="text" name="route-partition-key" placeholder="optional override" />
+                </div>
+                <div class="col-md-2 d-flex align-items-end">
+                    <button type="submit" class="btn btn-secondary w-100">Preview</button>
+                </div>
+            </div>
+            <div class="form-text">When provided, partition key overrides routing-key hashing for super-stream partition selection.</div>
+        </form>
+    </section>
+
     <div class="panel-grid">
         @if (selectedSuperStream != null)
         {
@@ -108,6 +138,7 @@ else
                             <th>Messages</th>
                             <th>Bytes</th>
                             <th>Consumers</th>
+                            <th>Logical Consumers</th>
                             <th>Max Lag</th>
                             <th>Offsets</th>
                             <th>Retention</th>
@@ -121,12 +152,41 @@ else
                             <td>@selectedSuperStream.messages</td>
                             <td>@FormatBytes(selectedSuperStream.bytes)</td>
                             <td>@selectedSuperStream.consumers</td>
+                            <td>@selectedSuperStream.logical_consumers</td>
                             <td>@selectedSuperStream.max_lag</td>
                             <td>@FormatSuperStreamOffsetRange(selectedSuperStream)</td>
                             <td>@FormatSuperStreamRetention(selectedSuperStream)</td>
                         </tr>
                     </tbody>
                 </table>
+                @if (selectedSuperStream.consumer_details.Count > 0)
+                {
+                    <table class="table table-striped">
+                        <thead>
+                            <tr>
+                                <th>Consumer</th>
+                                <th>Partitions</th>
+                                <th>Total Lag</th>
+                                <th>Max Lag</th>
+                                <th>Next Offsets</th>
+                                <th>Partition Detail</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var consumer in selectedSuperStream.consumer_details)
+                            {
+                                <tr>
+                                    <td>@consumer.consumer</td>
+                                    <td>@consumer.partition_count</td>
+                                    <td>@consumer.total_lag</td>
+                                    <td>@consumer.max_lag</td>
+                                    <td>@FormatSuperStreamConsumerOffsets(consumer)</td>
+                                    <td>@FormatSuperStreamConsumerPartitions(consumer)</td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                }
                 <table class="table table-striped">
                     <thead>
                         <tr>
@@ -176,10 +236,12 @@ else
                             <th>Messages</th>
                             <th>Bytes</th>
                             <th>Consumers</th>
+                            <th>Logical Consumers</th>
                             <th>Max Lag</th>
                             <th>Offset Range</th>
                             <th>Retention</th>
                             <th>Partition Detail</th>
+                            <th>Consumer Detail</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -192,10 +254,12 @@ else
                                 <td>@stream.messages</td>
                                 <td>@FormatBytes(stream.bytes)</td>
                                 <td>@stream.consumers</td>
+                                <td>@stream.logical_consumers</td>
                                 <td>@stream.max_lag</td>
                                 <td>@FormatSuperStreamOffsetRange(stream)</td>
                                 <td>@FormatSuperStreamRetention(stream)</td>
                                 <td>@FormatSuperStreamPartitionDetail(stream)</td>
+                                <td>@FormatSuperStreamConsumerDetail(stream)</td>
                             </tr>
                         }
                     </tbody>
@@ -401,6 +465,15 @@ else
             $"{p.name}:{p.messages} msg,{p.consumers} c,lag {p.max_lag}"));
     }
 
+    private static string FormatSuperStreamConsumerDetail(SuperStreamSummary stream)
+    {
+        if (stream.consumer_details.Count == 0)
+            return "-";
+
+        return string.Join(", ", stream.consumer_details.Select(c =>
+            $"{c.consumer}:{c.partition_count} p,lag {c.max_lag}"));
+    }
+
     private static string FormatSuperStreamOffsetRange(SuperStreamSummary stream)
     {
         if (!stream.min_head_offset.HasValue || !stream.max_tail_offset.HasValue)
@@ -428,5 +501,25 @@ else
             parts.Add($"max-age {TimeSpan.FromMilliseconds(partition.max_age_ms.Value):g}");
 
         return parts.Count == 0 ? "unbounded" : string.Join(", ", parts);
+    }
+
+    private static string FormatSuperStreamConsumerOffsets(SuperStreamConsumerSummary consumer)
+    {
+        if (!consumer.min_next_offset.HasValue || !consumer.max_next_offset.HasValue)
+            return "-";
+
+        if (consumer.min_next_offset.Value == consumer.max_next_offset.Value)
+            return consumer.min_next_offset.Value.ToString();
+
+        return $"{consumer.min_next_offset.Value}..{consumer.max_next_offset.Value}";
+    }
+
+    private static string FormatSuperStreamConsumerPartitions(SuperStreamConsumerSummary consumer)
+    {
+        if (consumer.partition_details.Count == 0)
+            return "-";
+
+        return string.Join(", ", consumer.partition_details.Select(p =>
+            $"{p.partition}:next {p.next_offset},lag {p.lag}"));
     }
 }

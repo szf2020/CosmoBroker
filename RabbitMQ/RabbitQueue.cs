@@ -840,6 +840,9 @@ public sealed class RabbitQueue
             if (_stream == null)
                 return 0;
 
+            if (spec?.Kind == RabbitStreamOffsetKind.Offset && spec.Offset.HasValue)
+                return spec.Offset.Value;
+
             if (_stream.Count == 0)
                 return _streamTailOffset + 1;
 
@@ -848,7 +851,6 @@ public sealed class RabbitQueue
                 RabbitStreamOffsetKind.First => _stream[0].StreamOffset,
                 RabbitStreamOffsetKind.Last => _stream[^1].StreamOffset,
                 RabbitStreamOffsetKind.Next => _streamTailOffset + 1,
-                RabbitStreamOffsetKind.Offset when spec.Offset.HasValue => spec.Offset.Value,
                 _ => _streamTailOffset + 1
             };
         }

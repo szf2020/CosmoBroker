@@ -20,6 +20,7 @@ public sealed class ExchangeManager
     private readonly MessageRepository? _repo;
     public ConcurrentDictionary<string, Exchange> Exchanges { get; } = new(StringComparer.OrdinalIgnoreCase);
     public ConcurrentDictionary<string, RabbitQueue> Queues { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public event Action<string, string>? StreamMessageAppended;
 
     public ExchangeManager(MessageRepository? repo = null)
     {
@@ -45,13 +46,14 @@ public sealed class ExchangeManager
         return exchange;
     }
 
-    public Exchange DeclareSuperStream(string vhost, string name, int partitions, bool durable = true, bool autoDelete = false)
+    public Exchange DeclareSuperStream(string vhost, string name, int partitions, bool durable = true, bool autoDelete = false, RabbitQueueArgs? partitionArgs = null)
     {
         if (partitions <= 0)
             throw new InvalidOperationException("Super stream partitions must be greater than zero.");
 
         var exchange = DeclareExchange(vhost, name, ExchangeType.SuperStream, durable, autoDelete, partitions);
         var resolvedVhost = NormalizeVhost(vhost);
+        var effectivePartitionArgs = partitionArgs ?? new RabbitQueueArgs();
 
         for (int i = 0; i < partitions; i++)
         {
@@ -61,7 +63,15 @@ public sealed class ExchangeManager
                 Type = RabbitQueueType.Stream,
                 Durable = durable,
                 Exclusive = false,
-                AutoDelete = autoDelete
+                AutoDelete = autoDelete,
+                MaxPriority = effectivePartitionArgs.MaxPriority,
+                DeadLetterExchange = effectivePartitionArgs.DeadLetterExchange,
+                DeadLetterRoutingKey = effectivePartitionArgs.DeadLetterRoutingKey,
+                MessageTtlMs = effectivePartitionArgs.MessageTtlMs,
+                QueueTtlMs = effectivePartitionArgs.QueueTtlMs,
+                StreamMaxLengthMessages = effectivePartitionArgs.StreamMaxLengthMessages,
+                StreamMaxLengthBytes = effectivePartitionArgs.StreamMaxLengthBytes,
+                StreamMaxAgeMs = effectivePartitionArgs.StreamMaxAgeMs
             });
 
             Bind(resolvedVhost, name, queue.Name, i.ToString());
@@ -304,6 +314,28 @@ public sealed class ExchangeManager
             message.PersistedId = _repo.EnqueueRabbitMessageAsync(queue.Vhost, queue.Name, message, immediatePersist).GetAwaiter().GetResult();
 
         queue.Enqueue(message);
+        if (queue.Type == RabbitQueueType.Stream)
+            StreamMessageAppended?.Invoke(queue.Vhost, queue.Name);
+    }
+
+    public bool TryAppendToStream(string vhost, string streamName, byte[] payload, out string? error, RabbitMessageProperties? properties = null, bool immediatePersist = false)
+    {
+        error = null;
+        var resolvedVhost = NormalizeVhost(vhost);
+        if (!Queues.TryGetValue(QueueKey(resolvedVhost, streamName), out var queue))
+        {
+            error = $"Stream '{streamName}' does not exist.";
+            return false;
+        }
+
+        if (queue.Type != RabbitQueueType.Stream)
+        {
+            error = $"Queue '{streamName}' is not a stream queue.";
+            return false;
+        }
+
+        EnqueueToQueue(queue, streamName, payload, headers: null, priority: 0, messageTtlMs: null, fromExchange: streamName, properties, immediatePersist);
+        return true;
     }
 
     // --- Consumer registration -----------------------------------------------
@@ -414,6 +446,67 @@ public sealed class ExchangeManager
         return true;
     }
 
+    public bool TryQueryStreamConsumerOffset(string vhost, string queueName, string consumerTag, out string? error, out long nextOffset)
+    {
+        error = null;
+        nextOffset = 0;
+
+        var resolvedVhost = NormalizeVhost(vhost);
+        if (!Queues.TryGetValue(QueueKey(resolvedVhost, queueName), out var queue))
+        {
+            error = $"Queue '{queueName}' does not exist.";
+            return false;
+        }
+
+        if (queue.Type != RabbitQueueType.Stream)
+        {
+            error = $"Queue '{queueName}' is not a stream queue.";
+            return false;
+        }
+
+        var snapshot = queue.GetStreamOffsetsSnapshot();
+        if (snapshot.TryGetValue(consumerTag, out nextOffset))
+            return true;
+
+        if (_repo != null)
+        {
+            var lastOffset = _repo.GetRabbitStreamConsumerOffsetAsync(resolvedVhost, queueName, consumerTag).GetAwaiter().GetResult();
+            if (lastOffset.HasValue)
+            {
+                nextOffset = lastOffset.Value + 1;
+                return true;
+            }
+        }
+
+        error = $"Offset for consumer '{consumerTag}' was not found.";
+        return false;
+    }
+
+    public bool TryStoreStreamConsumerOffset(string vhost, string queueName, string consumerTag, long nextOffset, out string? error)
+    {
+        error = null;
+        var resolvedVhost = NormalizeVhost(vhost);
+        if (!Queues.TryGetValue(QueueKey(resolvedVhost, queueName), out var queue))
+        {
+            error = $"Queue '{queueName}' does not exist.";
+            return false;
+        }
+
+        if (queue.Type != RabbitQueueType.Stream)
+        {
+            error = $"Queue '{queueName}' is not a stream queue.";
+            return false;
+        }
+
+        var offsetSpec = new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Offset, Offset = nextOffset };
+        queue.SetStreamOffset(consumerTag, offsetSpec);
+
+        if (_repo != null)
+            _repo.UpdateRabbitStreamConsumerOffsetAsync(resolvedVhost, queueName, consumerTag, Math.Max(0, nextOffset - 1)).GetAwaiter().GetResult();
+
+        return true;
+    }
+
     public bool TryResetSuperStreamConsumerOffset(string vhost, string exchangeName, string consumerTag, RabbitStreamOffsetSpec? streamOffset, out string? error, out Dictionary<string, long> partitionOffsets)
     {
         error = null;
@@ -462,6 +555,42 @@ public sealed class ExchangeManager
             partitionOffsets[partition] = nextOffset;
         }
 
+        return true;
+    }
+
+    public bool TryResolveSuperStreamPartition(string vhost, string exchangeName, string routingKey, string? partitionKey, out string? error, out string? partition)
+    {
+        error = null;
+        partition = null;
+
+        var resolvedVhost = NormalizeVhost(vhost);
+        if (!Exchanges.TryGetValue(ExchangeKey(resolvedVhost, exchangeName), out var exchange))
+        {
+            error = $"Exchange '{exchangeName}' does not exist.";
+            return false;
+        }
+
+        if (exchange.Type != ExchangeType.SuperStream)
+        {
+            error = $"Exchange '{exchangeName}' is not a super stream.";
+            return false;
+        }
+
+        string effectiveKey = !string.IsNullOrWhiteSpace(partitionKey) ? partitionKey : routingKey;
+        if (string.IsNullOrWhiteSpace(effectiveKey))
+        {
+            error = "Routing key or partition key is required.";
+            return false;
+        }
+
+        var resolved = exchange.ResolveSuperStreamPartition(effectiveKey);
+        if (string.IsNullOrWhiteSpace(resolved))
+        {
+            error = $"Super stream '{exchangeName}' has no partitions.";
+            return false;
+        }
+
+        partition = GetBindingDisplayName(resolved);
         return true;
     }
 

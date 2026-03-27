@@ -134,6 +134,26 @@ app.MapGet("/api/rabbitmq/super-stream", async ctx =>
     ctx.Response.WriteJson(summary);
 });
 
+app.MapGet("/api/rabbitmq/super-streams/route", async ctx =>
+{
+    var client = ctx.RequestServices.GetRequiredService<BrokerMonitorClient>();
+    var request = new SuperStreamRoutePreviewRequest
+    {
+        vhost = ctx.Request.Query.TryGetValue("vhost", out var vhostValue) && !string.IsNullOrWhiteSpace(vhostValue) ? vhostValue : "/",
+        exchange = ctx.Request.Query.TryGetValue("exchange", out var exchangeValue) ? exchangeValue : string.Empty,
+        routing_key = ctx.Request.Query.TryGetValue("routing_key", out var routingKeyValue) ? routingKeyValue : string.Empty,
+        partition_key = ctx.Request.Query.TryGetValue("partition_key", out var partitionKeyValue) ? partitionKeyValue : null
+    };
+
+    var result = await client.PreviewSuperStreamRouteAsync(request, ctx.RequestAborted);
+    if (!result.ok)
+    {
+        ctx.Response.StatusCode = 400;
+        ctx.Response.ReasonPhrase = "Bad Request";
+    }
+    ctx.Response.WriteJson(result);
+});
+
 app.MapPost("/api/rabbitmq/streams/reset-offset", async ctx =>
 {
     var client = ctx.RequestServices.GetRequiredService<BrokerMonitorClient>();
@@ -199,6 +219,30 @@ app.MapPost("/rabbitmq/super-streams/reset-offset", async ctx =>
         ? $"Reset {request.consumer} on {request.exchange} across {result.partitions.Count} partitions."
         : (result.error ?? "Unable to reset super stream offsets.");
     var query = $"status={(result.ok ? "ok" : "error")}&message={Uri.EscapeDataString(message)}";
+    ctx.Response.StatusCode = 302;
+    ctx.Response.ReasonPhrase = "Found";
+    ctx.Response.Headers["Location"] = $"/rabbitmq?{query}";
+});
+
+app.MapPost("/rabbitmq/super-streams/route-preview", async ctx =>
+{
+    var client = ctx.RequestServices.GetRequiredService<BrokerMonitorClient>();
+    var form = ctx.Request.ReadForm();
+    var request = new SuperStreamRoutePreviewRequest
+    {
+        vhost = form.Fields.TryGetValue("route-vhost", out var vhost) && !string.IsNullOrWhiteSpace(vhost) ? vhost : "/",
+        exchange = form.Fields.TryGetValue("route-exchange", out var exchange) ? exchange : string.Empty,
+        routing_key = form.Fields.TryGetValue("route-routing-key", out var routingKey) ? routingKey : string.Empty,
+        partition_key = form.Fields.TryGetValue("route-partition-key", out var partitionKey) && !string.IsNullOrWhiteSpace(partitionKey) ? partitionKey : null
+    };
+
+    var result = await client.PreviewSuperStreamRouteAsync(request, ctx.RequestAborted);
+    var message = result.ok
+        ? $"Super stream route resolves to {result.partition}."
+        : (result.error ?? "Unable to preview super stream route.");
+    var query = $"status={(result.ok ? "ok" : "error")}&message={Uri.EscapeDataString(message)}";
+    if (!string.IsNullOrWhiteSpace(request.exchange))
+        query += $"&super={Uri.EscapeDataString(request.exchange)}&vhost={Uri.EscapeDataString(request.vhost)}";
     ctx.Response.StatusCode = 302;
     ctx.Response.ReasonPhrase = "Found";
     ctx.Response.Headers["Location"] = $"/rabbitmq?{query}";

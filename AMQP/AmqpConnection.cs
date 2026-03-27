@@ -213,12 +213,22 @@ internal sealed class AmqpConnection : IAsyncDisposable
                     int? declaredSuperPartitions = declaredType == ExchangeType.SuperStream
                         ? (int?)(GetLongArg(exchangeArgs, "x-partitions") ?? 0)
                         : null;
+                    long? declaredSuperMaxLengthMessages = declaredType == ExchangeType.SuperStream
+                        ? GetLongArg(exchangeArgs, "x-max-length")
+                        : null;
+                    long? declaredSuperMaxLengthBytes = declaredType == ExchangeType.SuperStream
+                        ? GetLongArg(exchangeArgs, "x-max-length-bytes")
+                        : null;
+                    long? declaredSuperMaxAgeMs = declaredType == ExchangeType.SuperStream
+                        ? ParseDurationMs(GetStringArg(exchangeArgs, "x-max-age"))
+                        : null;
                     if (existingExchange != null &&
                         (existingExchange.Type != declaredType ||
                          existingExchange.Durable != durable ||
                          existingExchange.AutoDelete != autoDelete ||
                          (declaredType == ExchangeType.SuperStream &&
-                          existingExchange.SuperStreamPartitions != declaredSuperPartitions)))
+                          (existingExchange.SuperStreamPartitions != declaredSuperPartitions ||
+                           !SuperStreamRetentionMatches(exchangeName, declaredSuperMaxLengthMessages, declaredSuperMaxLengthBytes, declaredSuperMaxAgeMs)))))
                     {
                         await SendChannelCloseAsync(channelNumber, 406, $"Exchange '{exchangeName}' redeclared with different properties", classId, methodId, ct);
                         return;
@@ -235,7 +245,12 @@ internal sealed class AmqpConnection : IAsyncDisposable
                                 return;
                             }
 
-                            _manager.DeclareSuperStream(_vhost, exchangeName, partitions, durable, autoDelete);
+                            _manager.DeclareSuperStream(_vhost, exchangeName, partitions, durable, autoDelete, new RabbitQueueArgs
+                            {
+                                StreamMaxLengthMessages = declaredSuperMaxLengthMessages,
+                                StreamMaxLengthBytes = declaredSuperMaxLengthBytes,
+                                StreamMaxAgeMs = declaredSuperMaxAgeMs
+                            });
                         }
                         else
                         {
@@ -1368,6 +1383,17 @@ internal sealed class AmqpConnection : IAsyncDisposable
             'd' => magnitude * 86_400_000L,
             _ => null
         };
+    }
+
+    private bool SuperStreamRetentionMatches(string exchangeName, long? maxLengthMessages, long? maxLengthBytes, long? maxAgeMs)
+    {
+        var firstPartition = _manager.GetQueue(_vhost, $"{exchangeName}-0");
+        if (firstPartition == null)
+            return maxLengthMessages == null && maxLengthBytes == null && maxAgeMs == null;
+
+        return firstPartition.StreamMaxLengthMessages == maxLengthMessages &&
+               firstPartition.StreamMaxLengthBytes == maxLengthBytes &&
+               firstPartition.StreamMaxAgeMs == maxAgeMs;
     }
 
     private static Dictionary<string, string>? ToStringDictionary(Dictionary<string, object?>? args)

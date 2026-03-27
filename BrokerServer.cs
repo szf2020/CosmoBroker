@@ -17,11 +17,14 @@ public class BrokerServer : IAsyncDisposable
 {
     private readonly int _port;
     private readonly int _amqpPort;
+    private readonly int _streamPort;
     private Socket? _listenSocket;
     private Socket? _amqpListenSocket;
+    private Socket? _streamListenSocket;
     private CancellationTokenSource? _cts;
     private Task? _acceptTask;
     private Task? _amqpAcceptTask;
+    private Task? _streamAcceptTask;
     private readonly TopicTree _topicTree = new();
     private readonly Sublist _sublist = new();
     private readonly Persistence.MessageRepository? _repo;
@@ -64,10 +67,11 @@ public class BrokerServer : IAsyncDisposable
         return System.Text.Encoding.UTF8.GetBytes(msg);
     }
 
-    public BrokerServer(int port = 4222, int amqpPort = 0, Persistence.MessageRepository? repo = null, Auth.IAuthenticator? authenticator = null, X509Certificate2? serverCertificate = null, int monitorPort = 8222)
+    public BrokerServer(int port = 4222, int amqpPort = 0, int streamPort = 0, Persistence.MessageRepository? repo = null, Auth.IAuthenticator? authenticator = null, X509Certificate2? serverCertificate = null, int monitorPort = 8222)
     {
         _port = port;
         _amqpPort = amqpPort;
+        _streamPort = streamPort;
         _repo = repo;
         _authenticator = authenticator;
         _serverCertificate = serverCertificate;
@@ -156,6 +160,21 @@ public class BrokerServer : IAsyncDisposable
         {
             Console.WriteLine("[CosmoBroker] AMQP listener disabled.");
         }
+
+        if (_streamPort > 0)
+        {
+            _streamListenSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            _streamListenSocket.ReceiveBufferSize = 4 * 1024 * 1024;
+            _streamListenSocket.SendBufferSize = 4 * 1024 * 1024;
+            _streamListenSocket.Bind(new IPEndPoint(IPAddress.Any, _streamPort));
+            _streamListenSocket.Listen(1024);
+            Console.WriteLine($"[CosmoBroker] RabbitMQ Stream listener on port {_streamPort}...");
+            _streamAcceptTask = AcceptStreamLoopAsync(_cts.Token);
+        }
+        else
+        {
+            Console.WriteLine("[CosmoBroker] RabbitMQ Stream listener disabled.");
+        }
     }
 
     public void NotifySubscription(string subject, string sid, string? queueGroup = null)
@@ -219,6 +238,8 @@ public class BrokerServer : IAsyncDisposable
         => _rmqExchanges.TryResetStreamConsumerOffset(vhost, queueName, consumerTag, offset, out error, out nextOffset);
     public bool TryResetRabbitSuperStreamOffset(string vhost, string exchangeName, string consumerTag, RabbitMQ.RabbitStreamOffsetSpec? offset, out string? error, out Dictionary<string, long> partitionOffsets)
         => _rmqExchanges.TryResetSuperStreamConsumerOffset(vhost, exchangeName, consumerTag, offset, out error, out partitionOffsets);
+    public bool TryResolveRabbitSuperStreamPartition(string vhost, string exchangeName, string routingKey, string? partitionKey, out string? error, out string? partition)
+        => _rmqExchanges.TryResolveSuperStreamPartition(vhost, exchangeName, routingKey, partitionKey, out error, out partition);
     public object GetRoutez() => new { routes = _cluster.RouteCount };
     public object GetGatewayz() => new { gateways = _cluster.GatewayCount };
     public object GetLeafz() => new { leafnodes = _leafnodes.ConnectionCount };
@@ -303,12 +324,47 @@ public class BrokerServer : IAsyncDisposable
         catch (Exception ex) { if (!_lameDuckMode) Console.WriteLine($"[CosmoBroker] AMQP accept error: {ex.Message}"); }
     }
 
+    private async Task AcceptStreamLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested && !_lameDuckMode)
+            {
+                var socket = await _streamListenSocket!.AcceptAsync(ct);
+                socket.NoDelay = true;
+                socket.ReceiveBufferSize = 4 * 1024 * 1024;
+                socket.SendBufferSize = 4 * 1024 * 1024;
+                Interlocked.Increment(ref _totalConnections);
+
+                _ = Task.Run(async () =>
+                {
+                    Stream? stream = null;
+                    try
+                    {
+                        stream = new NetworkStream(socket, ownsSocket: true);
+                        await using var connection = new RabbitMQ.Streams.StreamConnection(stream, _rmqExchanges, _authenticator);
+                        await connection.RunAsync(ct);
+                    }
+                    catch
+                    {
+                        try { stream?.Dispose(); } catch { }
+                        try { socket.Dispose(); } catch { }
+                    }
+                }, ct);
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { if (!_lameDuckMode) Console.WriteLine($"[CosmoBroker] Stream accept error: {ex.Message}"); }
+    }
+
     public async ValueTask DisposeAsync()
     {
         _cts?.Cancel();
         _listenSocket?.Dispose();
         _amqpListenSocket?.Dispose();
+        _streamListenSocket?.Dispose();
         if (_acceptTask != null) { try { await _acceptTask; } catch { } }
         if (_amqpAcceptTask != null) { try { await _amqpAcceptTask; } catch { } }
+        if (_streamAcceptTask != null) { try { await _streamAcceptTask; } catch { } }
     }
 }

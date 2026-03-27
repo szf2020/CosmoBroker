@@ -177,6 +177,40 @@ public class MonitoringService
                     }
                 }
             }
+            else if (string.Equals(method, "GET", StringComparison.OrdinalIgnoreCase) && path == "/rmq/super-stream/route")
+            {
+                string vhost = query.TryGetValue("vhost", out var vhostValue) && !string.IsNullOrWhiteSpace(vhostValue)
+                    ? vhostValue
+                    : "/";
+                string exchange = query.TryGetValue("exchange", out var exchangeValue) ? exchangeValue : string.Empty;
+                string routingKey = query.TryGetValue("routing_key", out var routingKeyValue) ? routingKeyValue : string.Empty;
+                string? partitionKey = query.TryGetValue("partition_key", out var partitionKeyValue) ? partitionKeyValue : null;
+
+                if (string.IsNullOrWhiteSpace(exchange))
+                {
+                    statusCode = 400;
+                    reasonPhrase = "Bad Request";
+                    responseData = new { ok = false, error = "Exchange is required." };
+                }
+                else if (_server.TryResolveRabbitSuperStreamPartition(vhost, exchange, routingKey, partitionKey, out var error, out var partition))
+                {
+                    responseData = new
+                    {
+                        ok = true,
+                        vhost,
+                        exchange,
+                        routing_key = routingKey,
+                        partition_key = partitionKey,
+                        partition
+                    };
+                }
+                else
+                {
+                    statusCode = 400;
+                    reasonPhrase = "Bad Request";
+                    responseData = new { ok = false, error = error ?? "Unable to resolve super stream partition." };
+                }
+            }
             else
             {
                 responseData = new { error = "Not Found", paths = new[] { "/varz", "/connz", "/routez", "/leafz", "/gatewayz", "/jsz", "/rmqz" } };

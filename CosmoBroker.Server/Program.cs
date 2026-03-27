@@ -27,9 +27,11 @@ class Program
 
         var port = 4222;
         var amqpPort = 0;
+        var streamPort = 0;
         var monitorPort = 8222;
         var enableNats = true;
         var enableAmqp = false;
+        var enableStream = false;
         MessageRepository? repo = null;
 
         static bool TryParseBool(string? value, out bool result)
@@ -71,6 +73,12 @@ class Program
         else if (args.Length > 2 && int.TryParse(args[2], out var argAmqpPort))
             amqpPort = argAmqpPort;
 
+        var envStreamPort = Environment.GetEnvironmentVariable("COSMOBROKER_STREAM_PORT");
+        if (!string.IsNullOrWhiteSpace(envStreamPort) && int.TryParse(envStreamPort, out var envStreamParsed))
+            streamPort = envStreamParsed;
+        else if (args.Length > 3 && int.TryParse(args[3], out var argStreamPort))
+            streamPort = argStreamPort;
+
         var envEnableNats = Environment.GetEnvironmentVariable("COSMOBROKER_ENABLE_NATS");
         if (!string.IsNullOrWhiteSpace(envEnableNats) && TryParseBool(envEnableNats, out var parsedEnableNats))
             enableNats = parsedEnableNats;
@@ -78,6 +86,10 @@ class Program
         var envEnableAmqp = Environment.GetEnvironmentVariable("COSMOBROKER_ENABLE_AMQP");
         if (!string.IsNullOrWhiteSpace(envEnableAmqp) && TryParseBool(envEnableAmqp, out var parsedEnableAmqp))
             enableAmqp = parsedEnableAmqp;
+
+        var envEnableStream = Environment.GetEnvironmentVariable("COSMOBROKER_ENABLE_RMQ_STREAM");
+        if (!string.IsNullOrWhiteSpace(envEnableStream) && TryParseBool(envEnableStream, out var parsedEnableStream))
+            enableStream = parsedEnableStream;
 
         if (!enableNats)
             port = 0;
@@ -87,6 +99,12 @@ class Program
 
         if (!enableAmqp)
             amqpPort = 0;
+
+        if (enableStream && streamPort <= 0)
+            streamPort = 5552;
+
+        if (!enableStream)
+            streamPort = 0;
 
         var configPath = Environment.GetEnvironmentVariable("COSMOBROKER_CONFIG");
         BrokerConfig? config = null;
@@ -98,7 +116,7 @@ class Program
         if (!string.IsNullOrWhiteSpace(repoConnection))
             repo = new MessageRepository(repoConnection);
 
-        var server = new BrokerServer(port: port, amqpPort: amqpPort, repo: repo, monitorPort: monitorPort);
+        var server = new BrokerServer(port: port, amqpPort: amqpPort, streamPort: streamPort, repo: repo, monitorPort: monitorPort);
         var cts = new CancellationTokenSource();
 
         // Handle both Ctrl+C (SIGINT) and SIGTERM (docker stop / systemd)
@@ -117,7 +135,8 @@ class Program
 
         var natsStatus = port > 0 ? port.ToString() : "disabled";
         var amqpStatus = amqpPort > 0 ? amqpPort.ToString() : "disabled";
-        Console.WriteLine($"[CosmoBroker] Server is running. NATS: {natsStatus}, AMQP: {amqpStatus}. Press Ctrl+C to stop.");
+        var streamStatus = streamPort > 0 ? streamPort.ToString() : "disabled";
+        Console.WriteLine($"[CosmoBroker] Server is running. NATS: {natsStatus}, AMQP: {amqpStatus}, STREAM: {streamStatus}. Press Ctrl+C to stop.");
 
         try
         {

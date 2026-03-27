@@ -3850,6 +3850,78 @@ public class AmqpPersistenceInteropTests
     }
 
     [Fact]
+    public async Task AmqpClient_ShouldApplyAndValidateSuperStreamRetentionArguments()
+    {
+        const int port = 5698;
+        const int brokerPort = 4288;
+        const int monitorPort = 8288;
+
+        await using var server = new BrokerServer(port: brokerPort, amqpPort: port, monitorPort: monitorPort);
+        using var cts = new CancellationTokenSource();
+        await server.StartAsync(cts.Token);
+        await Task.Delay(250);
+
+        var factory = new ConnectionFactory
+        {
+            HostName = "127.0.0.1",
+            Port = port,
+            UserName = "guest",
+            Password = "guest",
+            VirtualHost = "/"
+        };
+
+        using var connection = factory.CreateConnection();
+        using var channel = connection.CreateModel();
+        channel.ExchangeDeclare(
+            "amqp.super.retention.x",
+            "x-super-stream",
+            durable: true,
+            autoDelete: false,
+            arguments: new Dictionary<string, object?>
+            {
+                ["x-partitions"] = 2L,
+                ["x-max-length"] = 50L,
+                ["x-max-length-bytes"] = 1024L,
+                ["x-max-age"] = "2s"
+            });
+
+        using var monitor = new HttpClient();
+        var rmqz = await monitor.GetStringAsync($"http://127.0.0.1:{monitorPort}/rmqz");
+        using var doc = JsonDocument.Parse(rmqz);
+        var queues = doc.RootElement.GetProperty("queues").EnumerateArray()
+            .Where(x => x.GetProperty("name").GetString() is "amqp.super.retention.x-0" or "amqp.super.retention.x-1")
+            .ToList();
+
+        Assert.Equal(2, queues.Count);
+        foreach (var queue in queues)
+        {
+            Assert.Equal("stream", queue.GetProperty("queue_type").GetString());
+            Assert.Equal(50L, queue.GetProperty("stream_max_length_messages").GetInt64());
+            Assert.Equal(1024L, queue.GetProperty("stream_max_length_bytes").GetInt64());
+            Assert.Equal(2000L, queue.GetProperty("stream_max_age_ms").GetInt64());
+        }
+
+        var ex = Assert.Throws<OperationInterruptedException>(() =>
+        {
+            channel.ExchangeDeclare(
+                "amqp.super.retention.x",
+                "x-super-stream",
+                durable: true,
+                autoDelete: false,
+                arguments: new Dictionary<string, object?>
+                {
+                    ["x-partitions"] = 2L,
+                    ["x-max-length"] = 51L,
+                    ["x-max-length-bytes"] = 1024L,
+                    ["x-max-age"] = "2s"
+                });
+        });
+
+        Assert.Equal((ushort)406, ex.ShutdownReason?.ReplyCode);
+        Assert.Contains("different properties", ex.ShutdownReason?.ReplyText ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task AmqpClient_ShouldUseSuperStreamPartitionHeaderOverride()
     {
         const int port = 5694;
@@ -3951,6 +4023,61 @@ public class AmqpPersistenceInteropTests
         Assert.NotEqual(indexA, indexB);
         Assert.Contains("msg-a", indexA == 0 ? q0Messages : q1Messages);
         Assert.Contains("msg-b", indexB == 0 ? q0Messages : q1Messages);
+    }
+
+    [Fact]
+    public async Task AmqpMonitor_ShouldPreviewSuperStreamRoute()
+    {
+        const int port = 5695;
+        const int brokerPort = 4285;
+        const int monitorPort = 8285;
+
+        await using var server = new BrokerServer(port: brokerPort, amqpPort: port, monitorPort: monitorPort);
+        using var cts = new CancellationTokenSource();
+        await server.StartAsync(cts.Token);
+        await Task.Delay(250);
+
+        var factory = new ConnectionFactory
+        {
+            HostName = "127.0.0.1",
+            Port = port,
+            UserName = "guest",
+            Password = "guest",
+            VirtualHost = "/"
+        };
+
+        using var connection = factory.CreateConnection();
+        using var channel = connection.CreateModel();
+        channel.ExchangeDeclare(
+            "amqp.super.preview.x",
+            "x-super-stream",
+            durable: true,
+            autoDelete: false,
+            arguments: new Dictionary<string, object?> { ["x-partitions"] = 2L });
+
+        using var client = new HttpClient();
+
+        string routingKey = "customer-42";
+        using var baseResponse = await client.GetAsync(
+            $"http://127.0.0.1:{monitorPort}/rmq/super-stream/route?vhost=%2F&exchange=amqp.super.preview.x&routing_key={Uri.EscapeDataString(routingKey)}");
+        baseResponse.EnsureSuccessStatusCode();
+        using var baseDoc = JsonDocument.Parse(await baseResponse.Content.ReadAsStringAsync());
+        Assert.True(baseDoc.RootElement.GetProperty("ok").GetBoolean());
+        string? basePartition = baseDoc.RootElement.GetProperty("partition").GetString();
+        Assert.Equal($"amqp.super.preview.x-{GetStablePartitionIndex(routingKey, 2)}", basePartition);
+
+        string overrideKey = GetStablePartitionIndex(routingKey, 2) == 0 ? "tenant-b" : "tenant-a";
+        if (GetStablePartitionIndex(overrideKey, 2) == GetStablePartitionIndex(routingKey, 2))
+            overrideKey = GetStablePartitionIndex(routingKey, 2) == 0 ? "tenant-c" : "tenant-d";
+
+        using var overrideResponse = await client.GetAsync(
+            $"http://127.0.0.1:{monitorPort}/rmq/super-stream/route?vhost=%2F&exchange=amqp.super.preview.x&routing_key={Uri.EscapeDataString(routingKey)}&partition_key={Uri.EscapeDataString(overrideKey)}");
+        overrideResponse.EnsureSuccessStatusCode();
+        using var overrideDoc = JsonDocument.Parse(await overrideResponse.Content.ReadAsStringAsync());
+        Assert.True(overrideDoc.RootElement.GetProperty("ok").GetBoolean());
+        string? overridePartition = overrideDoc.RootElement.GetProperty("partition").GetString();
+        Assert.Equal($"amqp.super.preview.x-{GetStablePartitionIndex(overrideKey, 2)}", overridePartition);
+        Assert.NotEqual(basePartition, overridePartition);
     }
 
     private static int GetStablePartitionIndex(string value, int partitions)
