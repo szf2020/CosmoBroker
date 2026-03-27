@@ -117,6 +117,9 @@ public sealed class RabbitMQService
 
                 var args = new RabbitQueueArgs
                 {
+                    Type = string.Equals(request.QueueType, "stream", StringComparison.OrdinalIgnoreCase)
+                        ? RabbitQueueType.Stream
+                        : RabbitQueueType.Classic,
                     Durable = request.Durable,
                     Exclusive = request.Exclusive,
                     AutoDelete = request.AutoDelete,
@@ -124,7 +127,9 @@ public sealed class RabbitMQService
                     DeadLetterExchange = request.DeadLetterExchange,
                     DeadLetterRoutingKey = request.DeadLetterRoutingKey,
                     MessageTtlMs = request.MessageTtlMs,
-                    QueueTtlMs = request.QueueTtlMs
+                    QueueTtlMs = request.QueueTtlMs,
+                    StreamMaxLengthBytes = request.StreamMaxLengthBytes,
+                    StreamMaxAgeMs = ParseDurationMs(request.StreamMaxAge)
                 };
                 var queue = _mgr.DeclareQueue(vhost, queueName, args);
                 return Ok(new { vhost, queue = queue.Name, durable = queue.Durable, message_count = queue.Count });
@@ -249,6 +254,7 @@ public sealed class RabbitMQService
         string? replySubject = ScopeSubject(req?.ReplySubject, account);
         bool autoAck = req?.AutoAck ?? true;
         string? ownerId = req?.OwnerId;
+        RabbitStreamOffsetSpec? streamOffset = ParseStreamOffset(req?.StreamOffset);
 
         if (replySubject == null)
             return Error("ConsumeRequest.ReplySubject is required");
@@ -280,7 +286,7 @@ public sealed class RabbitMQService
                 consumer_tag = tag
             };
             publish(replySubject, JsonSerializer.SerializeToUtf8Bytes(notice));
-        });
+        }, streamOffset: streamOffset);
 
         return Ok(new { vhost, consumer_tag = consumerTag, queue = queueName });
     }
@@ -511,6 +517,7 @@ public sealed class RabbitMQService
     private sealed class QueueDeclareRequest : VhostRequest
     {
         public string? Name { get; set; }
+        public string? QueueType { get; set; }
         public bool Durable { get; set; } = true;
         public bool Exclusive { get; set; }
         public bool AutoDelete { get; set; }
@@ -519,6 +526,8 @@ public sealed class RabbitMQService
         public string? DeadLetterRoutingKey { get; set; }
         public int? MessageTtlMs { get; set; }
         public int? QueueTtlMs { get; set; }
+        public long? StreamMaxLengthBytes { get; set; }
+        public string? StreamMaxAge { get; set; }
     }
 
     private sealed class BindRequest : VhostRequest
@@ -547,6 +556,7 @@ public sealed class RabbitMQService
     {
         public string? ConsumerTag { get; set; }
         public string? ReplySubject { get; set; }
+        public string? StreamOffset { get; set; }
         public int PrefetchCount { get; set; }
         public bool? AutoAck { get; set; }
         public string? OwnerId { get; set; }
@@ -574,5 +584,55 @@ public sealed class RabbitMQService
     {
         public string? ConsumerTag { get; set; }
         public int PrefetchCount { get; set; }
+    }
+
+    private static RabbitStreamOffsetSpec? ParseStreamOffset(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        if (long.TryParse(value, out var offset))
+            return new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Offset, Offset = offset };
+
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "first" => new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.First },
+            "last" => new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Last },
+            "next" => new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Next },
+            _ => null
+        };
+    }
+
+    private static long? ParseDurationMs(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        var text = value.Trim();
+        if (long.TryParse(text, out var rawMs))
+            return rawMs;
+
+        if (TimeSpan.TryParse(text, out var timeSpan))
+            return (long)timeSpan.TotalMilliseconds;
+
+        if (text.EndsWith("ms", StringComparison.OrdinalIgnoreCase) &&
+            long.TryParse(text[..^2], out var explicitMs))
+            return explicitMs;
+
+        if (text.Length < 2)
+            return null;
+
+        var suffix = char.ToLowerInvariant(text[^1]);
+        if (!long.TryParse(text[..^1], out var magnitude))
+            return null;
+
+        return suffix switch
+        {
+            's' => magnitude * 1000L,
+            'm' => magnitude * 60_000L,
+            'h' => magnitude * 3_600_000L,
+            'd' => magnitude * 86_400_000L,
+            _ => null
+        };
     }
 }

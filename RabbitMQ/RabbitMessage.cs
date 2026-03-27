@@ -12,6 +12,7 @@ public sealed class RabbitMessage
     private static long _globalDeliveryTag = 0;
 
     public long PersistedId { get; set; }
+    public long StreamOffset { get; set; }
 
     public ulong DeliveryTag { get; } = (ulong)Interlocked.Increment(ref _globalDeliveryTag);
 
@@ -25,6 +26,7 @@ public sealed class RabbitMessage
     public Dictionary<string, string>? Headers { get; init; }
 
     public RabbitMessageProperties Properties { get; init; } = new();
+    public DateTime CreatedAt { get; init; } = DateTime.UtcNow;
 
     /// <summary>Priority (0–255). Only meaningful when queue has x-max-priority.</summary>
     public byte Priority { get; init; } = 0;

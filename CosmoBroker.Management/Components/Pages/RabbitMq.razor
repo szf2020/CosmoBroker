@@ -4,6 +4,13 @@
 <h1>RabbitMQ</h1>
 <p class="subtle">RabbitMQ-compatible exchanges and queues surfaced from CosmoBroker's native AMQP layer.</p>
 
+@if (!string.IsNullOrWhiteSpace(_statusMessage))
+{
+    <div class="alert @(string.Equals(_statusKind, "ok", StringComparison.OrdinalIgnoreCase) ? "alert-success" : "alert-danger")">
+        @_statusMessage
+    </div>
+}
+
 @if (_rabbitMq == null)
 {
     <p><em>Loading RabbitMQ stats...</em></p>
@@ -18,8 +25,39 @@ else
         <div class="stat-card">
             <span>Queues</span>
             <strong>@_rabbitMq.queues.Count</strong>
+            <small>Streams: @_rabbitMq.queues.Count(x => IsStreamQueue(x))</small>
         </div>
     </div>
+
+    <section class="panel">
+        <div class="panel-head">
+            <h2>Reset Stream Consumer Offset</h2>
+        </div>
+        <form method="post" action="/rabbitmq/streams/reset-offset" class="stream-reset-form">
+            <div class="row g-2">
+                <div class="col-md-2">
+                    <label class="form-label" for="stream-vhost">Vhost</label>
+                    <input id="stream-vhost" class="form-control" type="text" name="vhost" value="/" />
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label" for="stream-queue">Queue</label>
+                    <input id="stream-queue" class="form-control" type="text" name="queue" placeholder="stream queue" />
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label" for="stream-consumer">Consumer</label>
+                    <input id="stream-consumer" class="form-control" type="text" name="consumer" placeholder="consumer tag" />
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label" for="stream-offset">Offset</label>
+                    <input id="stream-offset" class="form-control" type="text" name="offset" value="first" />
+                </div>
+                <div class="col-md-2 d-flex align-items-end">
+                    <button type="submit" class="btn btn-primary w-100">Reset</button>
+                </div>
+            </div>
+            <div class="form-text">Use <code>first</code>, <code>last</code>, <code>next</code>, or a numeric offset.</div>
+        </form>
+    </section>
 
     <div class="panel-grid">
         <section class="panel">
@@ -37,10 +75,16 @@ else
                         <tr>
                             <th>Vhost</th>
                             <th>Name</th>
+                            <th>Type</th>
                             <th>Messages</th>
+                            <th>Bytes</th>
                             <th>Consumers</th>
                             <th>Unacked</th>
                             <th>Durable</th>
+                            <th>Offsets</th>
+                            <th>Stream Retention</th>
+                            <th>Consumer Lag</th>
+                            <th>Stream Offsets</th>
                             <th>DLX</th>
                         </tr>
                     </thead>
@@ -50,10 +94,16 @@ else
                             <tr>
                                 <td>@queue.vhost</td>
                                 <td>@queue.name</td>
+                                <td>@FormatQueueType(queue)</td>
                                 <td>@queue.messages</td>
+                                <td>@FormatBytes(queue.bytes)</td>
                                 <td>@queue.consumers</td>
                                 <td>@queue.unacked</td>
                                 <td>@(queue.durable ? "yes" : "no")</td>
+                                <td>@FormatStreamBounds(queue)</td>
+                                <td>@FormatStreamRetention(queue)</td>
+                                <td>@FormatStreamLag(queue)</td>
+                                <td>@FormatStreamOffsets(queue)</td>
                                 <td>@(string.IsNullOrWhiteSpace(queue.dlx) ? "-" : queue.dlx)</td>
                             </tr>
                         }
@@ -100,10 +150,73 @@ else
 
 @code {
     private RabbitMqStats? _rabbitMq;
+    private string? _statusKind;
+    private string? _statusMessage;
 
     protected override async ValueTask OnInitializedAsync()
     {
+        _statusKind = HttpContext.Request.Query.TryGetValue("status", out var status) ? status : null;
+        _statusMessage = HttpContext.Request.Query.TryGetValue("message", out var message) ? message : null;
         var client = HttpContext.RequestServices.GetRequiredService<BrokerMonitorClient>();
         _rabbitMq = await client.GetRabbitMqAsync();
+    }
+
+    private static bool IsStreamQueue(RabbitQueueStats queue)
+        => string.Equals(queue.queue_type, "stream", StringComparison.OrdinalIgnoreCase);
+
+    private static string FormatQueueType(RabbitQueueStats queue)
+        => string.IsNullOrWhiteSpace(queue.queue_type) ? "classic" : queue.queue_type!;
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes >= 1024L * 1024 * 1024)
+            return $"{bytes / (1024d * 1024 * 1024):F2} GB";
+        if (bytes >= 1024L * 1024)
+            return $"{bytes / (1024d * 1024):F2} MB";
+        if (bytes >= 1024L)
+            return $"{bytes / 1024d:F2} KB";
+        return $"{bytes} B";
+    }
+
+    private static string FormatStreamRetention(RabbitQueueStats queue)
+    {
+        if (!IsStreamQueue(queue))
+            return "-";
+
+        var parts = new List<string>();
+        if (queue.stream_max_length_bytes.HasValue)
+            parts.Add($"max-bytes {FormatBytes(queue.stream_max_length_bytes.Value)}");
+        if (queue.stream_max_age_ms.HasValue)
+            parts.Add($"max-age {TimeSpan.FromMilliseconds(queue.stream_max_age_ms.Value):g}");
+
+        return parts.Count == 0 ? "unbounded" : string.Join(", ", parts);
+    }
+
+    private static string FormatStreamBounds(RabbitQueueStats queue)
+    {
+        if (!IsStreamQueue(queue))
+            return "-";
+
+        return $"{queue.stream_head_offset}..{queue.stream_tail_offset}";
+    }
+
+    private static string FormatStreamLag(RabbitQueueStats queue)
+    {
+        if (!IsStreamQueue(queue) || queue.stream_consumer_lag.Count == 0)
+            return "-";
+
+        return string.Join(", ", queue.stream_consumer_lag
+            .OrderBy(x => x.Key, StringComparer.Ordinal)
+            .Select(x => $"{x.Key}:{x.Value}"));
+    }
+
+    private static string FormatStreamOffsets(RabbitQueueStats queue)
+    {
+        if (!IsStreamQueue(queue) || queue.stream_offsets.Count == 0)
+            return "-";
+
+        return string.Join(", ", queue.stream_offsets
+            .OrderBy(x => x.Key, StringComparer.Ordinal)
+            .Select(x => $"{x.Key}:{x.Value}"));
     }
 }

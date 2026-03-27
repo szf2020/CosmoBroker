@@ -24,11 +24,15 @@ What works today:
 - transactions
 - durable queue and durable message restore when a repository is configured
 - vhost-aware permissions through the broker auth model
+- RabbitMQ-style stream queues via `x-queue-type=stream`
+- stream offsets using `x-stream-offset = first | last | next | <numeric>`
+- persisted stream consumer resume when a repository is configured
+- basic stream retention controls with `x-max-length-bytes` and `x-max-age`
 
 What is still outside current scope:
 
 - RabbitMQ quorum queues
-- RabbitMQ streams parity
+- full RabbitMQ streams parity
 - policies / operator policies
 - clustering / replication parity
 - RabbitMQ plugin ecosystem
@@ -134,6 +138,7 @@ The native AMQP path currently supports these common RabbitMQ client operations:
 
 - `queue.declare`
 - server-named queues
+- stream queue declaration with `x-queue-type=stream`
 - `queue.bind`
 - `queue.unbind`
 - `queue.delete`
@@ -161,6 +166,7 @@ The native AMQP path currently supports these common RabbitMQ client operations:
 - redelivery flags
 - consumer prefetch / qos
 - flow control on channel delivery
+- stream consume offsets with `x-stream-offset`
 
 ### Reliability
 
@@ -251,6 +257,69 @@ When `COSMOBROKER_REPO` is set:
 - AMQP properties for durable messages are restored
 
 This makes repo-backed CosmoBroker suitable for RabbitMQ-style durability testing and AMQP comparison runs.
+
+## Stream Queue Example
+
+CosmoBroker now supports a first RabbitMQ-style stream slice over AMQP queue declaration arguments.
+
+```csharp
+using System.Text;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+
+var factory = new ConnectionFactory
+{
+    HostName = "127.0.0.1",
+    Port = 5672,
+    UserName = "guest",
+    Password = "guest"
+};
+
+using var connection = factory.CreateConnection();
+using var channel = connection.CreateModel();
+
+channel.ExchangeDeclare("audit.stream.x", ExchangeType.Direct, durable: true, autoDelete: false);
+channel.QueueDeclare(
+    "audit.stream.q",
+    durable: true,
+    exclusive: false,
+    autoDelete: false,
+    arguments: new Dictionary<string, object?>
+    {
+        ["x-queue-type"] = "stream",
+        ["x-max-length-bytes"] = 1024 * 1024L,
+        ["x-max-age"] = "1h"
+    });
+channel.QueueBind("audit.stream.q", "audit.stream.x", "audit");
+
+channel.BasicPublish("audit.stream.x", "audit", basicProperties: null, body: Encoding.UTF8.GetBytes("event-1"));
+channel.BasicPublish("audit.stream.x", "audit", basicProperties: null, body: Encoding.UTF8.GetBytes("event-2"));
+
+var consumer = new AsyncEventingBasicConsumer(channel);
+consumer.Received += async (_, ea) =>
+{
+    Console.WriteLine(Encoding.UTF8.GetString(ea.Body.ToArray()));
+    channel.BasicAck(ea.DeliveryTag, false);
+    await Task.CompletedTask;
+};
+
+channel.BasicConsume(
+    "audit.stream.q",
+    autoAck: false,
+    consumerTag: "audit-reader",
+    noLocal: false,
+    exclusive: false,
+    arguments: new Dictionary<string, object?> { ["x-stream-offset"] = "first" },
+    consumer: consumer);
+```
+
+Current stream notes:
+
+- stream queues are append-only and non-destructive
+- `basic.get` is intentionally not supported for stream queues
+- when a repository is configured, acknowledged stream consumer offsets are persisted by `consumerTag`
+- the management UI and `/api/rabbitmq` surface queue type, retention settings, bytes, and tracked stream offsets
+- the management API can reset a persisted stream consumer offset through `/api/rabbitmq/streams/reset-offset`
 
 ## Compatibility Notes
 

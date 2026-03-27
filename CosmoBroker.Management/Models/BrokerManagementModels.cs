@@ -102,6 +102,24 @@ public sealed class RabbitMqStats
     public List<RabbitQueueStats> queues { get; set; } = [];
 }
 
+public sealed class StreamOffsetResetRequest
+{
+    public string vhost { get; set; } = "/";
+    public string queue { get; set; } = string.Empty;
+    public string consumer { get; set; } = string.Empty;
+    public string offset { get; set; } = "next";
+}
+
+public sealed class StreamOffsetResetResult
+{
+    public bool ok { get; set; }
+    public string? error { get; set; }
+    public string vhost { get; set; } = "/";
+    public string queue { get; set; } = string.Empty;
+    public string consumer { get; set; } = string.Empty;
+    public long next_offset { get; set; }
+}
+
 public sealed class RabbitExchangeStats
 {
     public string? vhost { get; set; }
@@ -115,8 +133,16 @@ public sealed class RabbitQueueStats
     public string? vhost { get; set; }
     public string? name { get; set; }
     public int messages { get; set; }
+    public long bytes { get; set; }
     public int consumers { get; set; }
     public int unacked { get; set; }
+    public string? queue_type { get; set; }
+    public long stream_head_offset { get; set; }
+    public long stream_tail_offset { get; set; }
+    public long? stream_max_length_bytes { get; set; }
+    public long? stream_max_age_ms { get; set; }
+    public Dictionary<string, long> stream_offsets { get; set; } = [];
+    public Dictionary<string, long> stream_consumer_lag { get; set; } = [];
     public bool durable { get; set; }
     public string? dlx { get; set; }
     public int? max_priority { get; set; }

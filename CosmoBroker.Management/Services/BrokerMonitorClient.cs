@@ -1,4 +1,5 @@
 using System.Net.Http.Json;
+using System.Net;
 using CosmoBroker.Management.Models;
 
 namespace CosmoBroker.Management.Services;
@@ -81,6 +82,21 @@ public sealed class BrokerMonitorClient
     public async Task<RabbitMqStats> GetRabbitMqAsync(CancellationToken cancellationToken = default)
         => await GetAsync<RabbitMqStats>("rmqz", cancellationToken) ?? new RabbitMqStats();
 
+    public async Task<StreamOffsetResetResult> ResetStreamOffsetAsync(StreamOffsetResetRequest request, CancellationToken cancellationToken = default)
+    {
+        var relativePath =
+            $"rmq/stream/reset?vhost={Encode(request.vhost)}&queue={Encode(request.queue)}&consumer={Encode(request.consumer)}&offset={Encode(request.offset)}";
+
+        using var response = await _httpClient.PostAsync(relativePath, content: null, cancellationToken);
+        var result = await response.Content.ReadFromJsonAsync<StreamOffsetResetResult>(cancellationToken: cancellationToken)
+            ?? new StreamOffsetResetResult { ok = false, error = "Empty response from broker monitor." };
+
+        if (!response.IsSuccessStatusCode && string.IsNullOrWhiteSpace(result.error))
+            result.error = $"Broker monitor returned {(int)response.StatusCode}.";
+
+        return result;
+    }
+
     private async Task<T?> GetAsync<T>(string relativePath, CancellationToken cancellationToken)
     {
         using var response = await _httpClient.GetAsync(relativePath, cancellationToken);
@@ -90,4 +106,7 @@ public sealed class BrokerMonitorClient
 
     private static string AppendTrailingSlash(string baseUrl)
         => baseUrl.EndsWith("/", StringComparison.Ordinal) ? baseUrl : baseUrl + "/";
+
+    private static string Encode(string? value)
+        => WebUtility.UrlEncode(value ?? string.Empty);
 }

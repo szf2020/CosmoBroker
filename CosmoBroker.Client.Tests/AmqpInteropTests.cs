@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using CosmoBroker.Auth;
@@ -2427,6 +2428,231 @@ public class AmqpInteropTests : IAsyncDisposable
         var channelOpenOk = await ReadAmqpFrameAsync(stream);
         AssertMethod(channelOpenOk.Payload, 20, 11);
     }
+
+    [Fact]
+    public async Task AmqpClient_ShouldEnforceStreamMaxLengthBytes()
+    {
+        const int port = 5683;
+        const int brokerPort = 4273;
+        const int monitorPort = 8273;
+
+        await using var server = new BrokerServer(port: brokerPort, amqpPort: port, monitorPort: monitorPort);
+        using var cts = new CancellationTokenSource();
+        await server.StartAsync(cts.Token);
+        await Task.Delay(250);
+
+        var factory = new ConnectionFactory
+        {
+            HostName = "127.0.0.1",
+            Port = port,
+            UserName = "guest",
+            Password = "guest",
+            VirtualHost = "/",
+            DispatchConsumersAsync = true
+        };
+
+        using var connection = factory.CreateConnection();
+        using var setupChannel = connection.CreateModel();
+
+        setupChannel.ExchangeDeclare("amqp.stream.length.x", ExchangeType.Direct, durable: true, autoDelete: false);
+        setupChannel.QueueDeclare(
+            "amqp.stream.length.q",
+            durable: true,
+            exclusive: false,
+            autoDelete: false,
+            arguments: new Dictionary<string, object?> { ["x-queue-type"] = "stream", ["x-max-length-bytes"] = 6L });
+        setupChannel.QueueBind("amqp.stream.length.q", "amqp.stream.length.x", "stream");
+        setupChannel.BasicPublish("amqp.stream.length.x", "stream", basicProperties: null, body: Encoding.UTF8.GetBytes("1111"));
+        setupChannel.BasicPublish("amqp.stream.length.x", "stream", basicProperties: null, body: Encoding.UTF8.GetBytes("2222"));
+
+        using (var monitor = new HttpClient())
+        {
+            var rmqz = await monitor.GetStringAsync($"http://127.0.0.1:{monitorPort}/rmqz");
+            using var doc = JsonDocument.Parse(rmqz);
+            var queue = doc.RootElement.GetProperty("queues")
+                .EnumerateArray()
+                .FirstOrDefault(x => x.TryGetProperty("name", out var name) && name.GetString() == "amqp.stream.length.q");
+            Assert.True(queue.ValueKind != JsonValueKind.Undefined, rmqz);
+            Assert.Equal("stream", queue.GetProperty("queue_type").GetString());
+            Assert.Equal(6L, queue.GetProperty("stream_max_length_bytes").GetInt64());
+        }
+
+        using var channel = connection.CreateModel();
+        var delivered = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var consumer = new AsyncEventingBasicConsumer(channel);
+        consumer.Received += async (_, ea) =>
+        {
+            delivered.TrySetResult(Encoding.UTF8.GetString(ea.Body.ToArray()));
+            await Task.CompletedTask;
+        };
+
+        channel.BasicConsume(
+            "amqp.stream.length.q",
+            autoAck: true,
+            consumerTag: "stream-length",
+            noLocal: false,
+            exclusive: false,
+            arguments: new Dictionary<string, object?> { ["x-stream-offset"] = "first" },
+            consumer: consumer);
+
+        Assert.Equal("2222", await delivered.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task AmqpClient_ShouldEnforceStreamMaxAge()
+    {
+        const int port = 5684;
+        const int brokerPort = 4274;
+        const int monitorPort = 8274;
+
+        await using var server = new BrokerServer(port: brokerPort, amqpPort: port, monitorPort: monitorPort);
+        using var cts = new CancellationTokenSource();
+        await server.StartAsync(cts.Token);
+        await Task.Delay(250);
+
+        var factory = new ConnectionFactory
+        {
+            HostName = "127.0.0.1",
+            Port = port,
+            UserName = "guest",
+            Password = "guest",
+            VirtualHost = "/",
+            DispatchConsumersAsync = true
+        };
+
+        using var connection = factory.CreateConnection();
+        using var setupChannel = connection.CreateModel();
+
+        setupChannel.ExchangeDeclare("amqp.stream.age.x", ExchangeType.Direct, durable: true, autoDelete: false);
+        setupChannel.QueueDeclare(
+            "amqp.stream.age.q",
+            durable: true,
+            exclusive: false,
+            autoDelete: false,
+            arguments: new Dictionary<string, object?> { ["x-queue-type"] = "stream", ["x-max-age"] = "200ms" });
+        setupChannel.QueueBind("amqp.stream.age.q", "amqp.stream.age.x", "stream");
+        setupChannel.BasicPublish("amqp.stream.age.x", "stream", basicProperties: null, body: Encoding.UTF8.GetBytes("old"));
+        await Task.Delay(300);
+        setupChannel.BasicPublish("amqp.stream.age.x", "stream", basicProperties: null, body: Encoding.UTF8.GetBytes("new"));
+
+        using (var monitor = new HttpClient())
+        {
+            var rmqz = await monitor.GetStringAsync($"http://127.0.0.1:{monitorPort}/rmqz");
+            using var doc = JsonDocument.Parse(rmqz);
+            var queue = doc.RootElement.GetProperty("queues")
+                .EnumerateArray()
+                .FirstOrDefault(x => x.TryGetProperty("name", out var name) && name.GetString() == "amqp.stream.age.q");
+            Assert.True(queue.ValueKind != JsonValueKind.Undefined, rmqz);
+            Assert.Equal("stream", queue.GetProperty("queue_type").GetString());
+            Assert.Equal(200L, queue.GetProperty("stream_max_age_ms").GetInt64());
+        }
+
+        using var channel = connection.CreateModel();
+        var delivered = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var consumer = new AsyncEventingBasicConsumer(channel);
+        consumer.Received += async (_, ea) =>
+        {
+            delivered.TrySetResult(Encoding.UTF8.GetString(ea.Body.ToArray()));
+            await Task.CompletedTask;
+        };
+
+        channel.BasicConsume(
+            "amqp.stream.age.q",
+            autoAck: true,
+            consumerTag: "stream-age",
+            noLocal: false,
+            exclusive: false,
+            arguments: new Dictionary<string, object?> { ["x-stream-offset"] = "first" },
+            consumer: consumer);
+
+        Assert.Equal("new", await delivered.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task AmqpMonitor_ShouldExposeStreamQueueMetadataAndOffsets()
+    {
+        const int port = 5685;
+        const int brokerPort = 4275;
+        const int monitorPort = 8275;
+
+        await using var server = new BrokerServer(port: brokerPort, amqpPort: port, monitorPort: monitorPort);
+        using var cts = new CancellationTokenSource();
+        await server.StartAsync(cts.Token);
+        await Task.Delay(250);
+
+        var factory = new ConnectionFactory
+        {
+            HostName = "127.0.0.1",
+            Port = port,
+            UserName = "guest",
+            Password = "guest",
+            VirtualHost = "/",
+            DispatchConsumersAsync = true
+        };
+
+        using var connection = factory.CreateConnection();
+        using var setupChannel = connection.CreateModel();
+
+        setupChannel.ExchangeDeclare("amqp.stream.monitor.x", ExchangeType.Direct, durable: true, autoDelete: false);
+        setupChannel.QueueDeclare(
+            "amqp.stream.monitor.q",
+            durable: true,
+            exclusive: false,
+            autoDelete: false,
+            arguments: new Dictionary<string, object?>
+            {
+                ["x-queue-type"] = "stream",
+                ["x-max-length-bytes"] = 1024L,
+                ["x-max-age"] = "2s"
+            });
+        setupChannel.QueueBind("amqp.stream.monitor.q", "amqp.stream.monitor.x", "stream");
+        setupChannel.BasicPublish("amqp.stream.monitor.x", "stream", basicProperties: null, body: Encoding.UTF8.GetBytes("stream-monitor-1"));
+
+        using var channel = connection.CreateModel();
+        var delivered = new TaskCompletionSource<ulong>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var consumer = new AsyncEventingBasicConsumer(channel);
+        consumer.Received += async (_, ea) =>
+        {
+            channel.BasicAck(ea.DeliveryTag, false);
+            delivered.TrySetResult(ea.DeliveryTag);
+            await Task.CompletedTask;
+        };
+
+        channel.BasicConsume(
+            "amqp.stream.monitor.q",
+            autoAck: false,
+            consumerTag: "stream-monitor-consumer",
+            noLocal: false,
+            exclusive: false,
+            arguments: new Dictionary<string, object?> { ["x-stream-offset"] = "first" },
+            consumer: consumer);
+
+        await delivered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.Delay(150);
+
+        using var monitor = new HttpClient();
+        var rmqz = await monitor.GetStringAsync($"http://127.0.0.1:{monitorPort}/rmqz");
+        using var doc = JsonDocument.Parse(rmqz);
+        var queue = doc.RootElement.GetProperty("queues")
+            .EnumerateArray()
+            .FirstOrDefault(x => x.TryGetProperty("name", out var name) && name.GetString() == "amqp.stream.monitor.q");
+
+        Assert.True(queue.ValueKind != JsonValueKind.Undefined, rmqz);
+        Assert.Equal("stream", queue.GetProperty("queue_type").GetString());
+        Assert.Equal(1024L, queue.GetProperty("stream_max_length_bytes").GetInt64());
+        Assert.Equal(2000L, queue.GetProperty("stream_max_age_ms").GetInt64());
+        Assert.True(queue.GetProperty("bytes").GetInt64() > 0);
+        Assert.Equal(1L, queue.GetProperty("stream_head_offset").GetInt64());
+        Assert.Equal(1L, queue.GetProperty("stream_tail_offset").GetInt64());
+
+        var offsets = queue.GetProperty("stream_offsets");
+        Assert.True(offsets.TryGetProperty("stream-monitor-consumer", out var nextOffset), rmqz);
+        Assert.True(nextOffset.GetInt64() >= 2L, rmqz);
+
+        var lag = queue.GetProperty("stream_consumer_lag");
+        Assert.True(lag.TryGetProperty("stream-monitor-consumer", out var consumerLag), rmqz);
+        Assert.True(consumerLag.GetInt64() >= 0L, rmqz);
+    }
 }
 
 public class AmqpAuthInteropTests : IAsyncDisposable
@@ -2803,6 +3029,376 @@ public class AmqpPersistenceInteropTests
             Assert.Equal((byte)2, message.BasicProperties.DeliveryMode);
             Assert.True(message.BasicProperties.Headers.ContainsKey("tenant"));
             Assert.Equal("{\"persist\":true}", Encoding.UTF8.GetString(message.Body.ToArray()));
+        }
+
+        try { File.Delete(dbPath); } catch { }
+    }
+
+    [Fact]
+    public async Task AmqpClient_ShouldReplayStreamQueueFromFirstOffset()
+    {
+        const int port = 5679;
+        const int brokerPort = 4269;
+        const int monitorPort = 8269;
+
+        await using var server = new BrokerServer(port: brokerPort, amqpPort: port, monitorPort: monitorPort);
+        using var cts = new CancellationTokenSource();
+        await server.StartAsync(cts.Token);
+        await Task.Delay(250);
+
+        var factory = new ConnectionFactory
+        {
+            HostName = "127.0.0.1",
+            Port = port,
+            UserName = "guest",
+            Password = "guest",
+            VirtualHost = "/",
+            DispatchConsumersAsync = true
+        };
+
+        using var connection = factory.CreateConnection();
+        using var setupChannel = connection.CreateModel();
+
+        setupChannel.ExchangeDeclare("amqp.stream.replay.x", ExchangeType.Direct, durable: true, autoDelete: false);
+        setupChannel.QueueDeclare(
+            "amqp.stream.replay.q",
+            durable: true,
+            exclusive: false,
+            autoDelete: false,
+            arguments: new Dictionary<string, object?> { ["x-queue-type"] = "stream" });
+        setupChannel.QueueBind("amqp.stream.replay.q", "amqp.stream.replay.x", "stream");
+        setupChannel.BasicPublish("amqp.stream.replay.x", "stream", basicProperties: null, body: Encoding.UTF8.GetBytes("stream-1"));
+
+        using var firstChannel = connection.CreateModel();
+        using var secondChannel = connection.CreateModel();
+
+        var firstDelivery = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondDelivery = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var firstConsumer = new AsyncEventingBasicConsumer(firstChannel);
+        firstConsumer.Received += async (_, ea) =>
+        {
+            firstDelivery.TrySetResult(Encoding.UTF8.GetString(ea.Body.ToArray()));
+            await Task.CompletedTask;
+        };
+
+        var secondConsumer = new AsyncEventingBasicConsumer(secondChannel);
+        secondConsumer.Received += async (_, ea) =>
+        {
+            secondDelivery.TrySetResult(Encoding.UTF8.GetString(ea.Body.ToArray()));
+            await Task.CompletedTask;
+        };
+
+        var consumeArgs = new Dictionary<string, object?> { ["x-stream-offset"] = "first" };
+        firstChannel.BasicConsume("amqp.stream.replay.q", autoAck: true, consumerTag: "stream-first-1", noLocal: false, exclusive: false, arguments: consumeArgs, consumer: firstConsumer);
+        secondChannel.BasicConsume("amqp.stream.replay.q", autoAck: true, consumerTag: "stream-first-2", noLocal: false, exclusive: false, arguments: consumeArgs, consumer: secondConsumer);
+
+        Assert.Equal("stream-1", await firstDelivery.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal("stream-1", await secondDelivery.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task AmqpClient_ShouldTailStreamQueueFromNextOffset()
+    {
+        const int port = 5680;
+        const int brokerPort = 4270;
+        const int monitorPort = 8270;
+
+        await using var server = new BrokerServer(port: brokerPort, amqpPort: port, monitorPort: monitorPort);
+        using var cts = new CancellationTokenSource();
+        await server.StartAsync(cts.Token);
+        await Task.Delay(250);
+
+        var factory = new ConnectionFactory
+        {
+            HostName = "127.0.0.1",
+            Port = port,
+            UserName = "guest",
+            Password = "guest",
+            VirtualHost = "/",
+            DispatchConsumersAsync = true
+        };
+
+        using var connection = factory.CreateConnection();
+        using var setupChannel = connection.CreateModel();
+
+        setupChannel.ExchangeDeclare("amqp.stream.tail.x", ExchangeType.Direct, durable: true, autoDelete: false);
+        setupChannel.QueueDeclare(
+            "amqp.stream.tail.q",
+            durable: true,
+            exclusive: false,
+            autoDelete: false,
+            arguments: new Dictionary<string, object?> { ["x-queue-type"] = "stream" });
+        setupChannel.QueueBind("amqp.stream.tail.q", "amqp.stream.tail.x", "stream");
+        setupChannel.BasicPublish("amqp.stream.tail.x", "stream", basicProperties: null, body: Encoding.UTF8.GetBytes("before-consume"));
+
+        using var channel = connection.CreateModel();
+        var delivered = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var consumer = new AsyncEventingBasicConsumer(channel);
+        consumer.Received += async (_, ea) =>
+        {
+            delivered.TrySetResult(Encoding.UTF8.GetString(ea.Body.ToArray()));
+            await Task.CompletedTask;
+        };
+
+        channel.BasicConsume(
+            "amqp.stream.tail.q",
+            autoAck: true,
+            consumerTag: "stream-next",
+            noLocal: false,
+            exclusive: false,
+            arguments: new Dictionary<string, object?> { ["x-stream-offset"] = "next" },
+            consumer: consumer);
+
+        await Task.Delay(200);
+        setupChannel.BasicPublish("amqp.stream.tail.x", "stream", basicProperties: null, body: Encoding.UTF8.GetBytes("after-consume"));
+
+        Assert.Equal("after-consume", await delivered.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task AmqpStreamConsumerOffset_ShouldSurviveRestart()
+    {
+        string dbPath = Path.Combine(Path.GetTempPath(), $"cosmobroker-amqp-stream-offset-{Guid.NewGuid():N}.db");
+        string connectionString = $"Data Source={dbPath};";
+        const int port1 = 4271;
+        const int mon1 = 8271;
+        const int amqp1 = 5681;
+
+        var repo1 = new MessageRepository(connectionString);
+        await using (var server1 = new BrokerServer(port: port1, amqpPort: amqp1, repo: repo1, monitorPort: mon1))
+        {
+            using var cts = new CancellationTokenSource();
+            await server1.StartAsync(cts.Token);
+            await Task.Delay(250);
+
+            var factory = new ConnectionFactory
+            {
+                HostName = "127.0.0.1",
+                Port = amqp1,
+                UserName = "guest",
+                Password = "guest",
+                VirtualHost = "/",
+                DispatchConsumersAsync = true
+            };
+
+            using var connection = factory.CreateConnection();
+            using var setupChannel = connection.CreateModel();
+            setupChannel.ExchangeDeclare("amqp.stream.persist.x", ExchangeType.Direct, durable: true, autoDelete: false);
+            setupChannel.QueueDeclare(
+                "amqp.stream.persist.q",
+                durable: true,
+                exclusive: false,
+                autoDelete: false,
+                arguments: new Dictionary<string, object?> { ["x-queue-type"] = "stream" });
+            setupChannel.QueueBind("amqp.stream.persist.q", "amqp.stream.persist.x", "stream");
+            setupChannel.BasicPublish("amqp.stream.persist.x", "stream", basicProperties: null, body: Encoding.UTF8.GetBytes("stream-a"));
+
+            using var channel = connection.CreateModel();
+            var delivered = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var consumer = new AsyncEventingBasicConsumer(channel);
+            consumer.Received += async (_, ea) =>
+            {
+                delivered.TrySetResult(Encoding.UTF8.GetString(ea.Body.ToArray()));
+                channel.BasicAck(ea.DeliveryTag, false);
+                await Task.CompletedTask;
+            };
+
+            channel.BasicConsume(
+                "amqp.stream.persist.q",
+                autoAck: false,
+                consumerTag: "stream-persist-consumer",
+                noLocal: false,
+                exclusive: false,
+                arguments: new Dictionary<string, object?> { ["x-stream-offset"] = "first" },
+                consumer: consumer);
+
+            Assert.Equal("stream-a", await delivered.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+        }
+
+        const int port2 = 4272;
+        const int mon2 = 8272;
+        const int amqp2 = 5682;
+
+        var repo2 = new MessageRepository(connectionString);
+        await using (var server2 = new BrokerServer(port: port2, amqpPort: amqp2, repo: repo2, monitorPort: mon2))
+        {
+            using var cts = new CancellationTokenSource();
+            await server2.StartAsync(cts.Token);
+            await Task.Delay(250);
+
+            var factory = new ConnectionFactory
+            {
+                HostName = "127.0.0.1",
+                Port = amqp2,
+                UserName = "guest",
+                Password = "guest",
+                VirtualHost = "/",
+                DispatchConsumersAsync = true
+            };
+
+            using var connection = factory.CreateConnection();
+            using var setupChannel = connection.CreateModel();
+            using var channel = connection.CreateModel();
+            var delivered = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var consumer = new AsyncEventingBasicConsumer(channel);
+            consumer.Received += async (_, ea) =>
+            {
+                delivered.TrySetResult(Encoding.UTF8.GetString(ea.Body.ToArray()));
+                channel.BasicAck(ea.DeliveryTag, false);
+                await Task.CompletedTask;
+            };
+
+            channel.BasicConsume(
+                "amqp.stream.persist.q",
+                autoAck: false,
+                consumerTag: "stream-persist-consumer",
+                noLocal: false,
+                exclusive: false,
+                arguments: null,
+                consumer: consumer);
+
+            await Task.Delay(200);
+            setupChannel.BasicPublish("amqp.stream.persist.x", "stream", basicProperties: null, body: Encoding.UTF8.GetBytes("stream-b"));
+
+            Assert.Equal("stream-b", await delivered.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+        }
+
+        try { File.Delete(dbPath); } catch { }
+    }
+
+    [Fact]
+    public async Task AmqpMonitor_ShouldResetPersistedStreamConsumerOffset()
+    {
+        string dbPath = Path.Combine(Path.GetTempPath(), $"cosmobroker-amqp-stream-reset-{Guid.NewGuid():N}.db");
+        string connectionString = $"Data Source={dbPath};";
+        const int brokerPort1 = 4276;
+        const int monitorPort1 = 8276;
+        const int amqpPort1 = 5686;
+
+        var repo1 = new MessageRepository(connectionString);
+        await using (var server1 = new BrokerServer(port: brokerPort1, amqpPort: amqpPort1, repo: repo1, monitorPort: monitorPort1))
+        {
+            using var cts = new CancellationTokenSource();
+            await server1.StartAsync(cts.Token);
+            await Task.Delay(250);
+
+            var factory = new ConnectionFactory
+            {
+                HostName = "127.0.0.1",
+                Port = amqpPort1,
+                UserName = "guest",
+                Password = "guest",
+                VirtualHost = "/",
+                DispatchConsumersAsync = true
+            };
+
+            using (var connection = factory.CreateConnection())
+            {
+                using var setupChannel = connection.CreateModel();
+                setupChannel.ExchangeDeclare("amqp.stream.reset.x", ExchangeType.Direct, durable: true, autoDelete: false);
+                setupChannel.QueueDeclare(
+                    "amqp.stream.reset.q",
+                    durable: true,
+                    exclusive: false,
+                    autoDelete: false,
+                    arguments: new Dictionary<string, object?> { ["x-queue-type"] = "stream" });
+                setupChannel.QueueBind("amqp.stream.reset.q", "amqp.stream.reset.x", "stream");
+                setupChannel.BasicPublish("amqp.stream.reset.x", "stream", basicProperties: null, body: Encoding.UTF8.GetBytes("reset-a"));
+                setupChannel.BasicPublish("amqp.stream.reset.x", "stream", basicProperties: null, body: Encoding.UTF8.GetBytes("reset-b"));
+
+                using var channel = connection.CreateModel();
+                channel.BasicQos(0, 1, global: false);
+                var delivered = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var consumer = new AsyncEventingBasicConsumer(channel);
+                consumer.Received += async (_, ea) =>
+                {
+                    delivered.TrySetResult(Encoding.UTF8.GetString(ea.Body.ToArray()));
+                    channel.BasicAck(ea.DeliveryTag, false);
+                    channel.BasicCancel("stream-reset-consumer");
+                    await Task.CompletedTask;
+                };
+
+                channel.BasicConsume(
+                    "amqp.stream.reset.q",
+                    autoAck: false,
+                    consumerTag: "stream-reset-consumer",
+                    noLocal: false,
+                    exclusive: false,
+                    arguments: new Dictionary<string, object?> { ["x-stream-offset"] = "first" },
+                    consumer: consumer);
+
+                Assert.Equal("reset-a", await delivered.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+            }
+
+            using var client = new HttpClient();
+            using var response = await client.PostAsync(
+                $"http://127.0.0.1:{monitorPort1}/rmq/stream/reset?vhost=%2F&queue=amqp.stream.reset.q&consumer=stream-reset-consumer&offset=first",
+                content: null);
+            response.EnsureSuccessStatusCode();
+            var payload = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(payload);
+            Assert.True(doc.RootElement.GetProperty("ok").GetBoolean(), payload);
+            Assert.Equal(1L, doc.RootElement.GetProperty("next_offset").GetInt64());
+        }
+
+        Assert.Equal(0L, await repo1.GetRabbitStreamConsumerOffsetAsync("/", "amqp.stream.reset.q", "stream-reset-consumer"));
+
+        const int brokerPort2 = 4277;
+        const int monitorPort2 = 8277;
+        const int amqpPort2 = 5687;
+
+        var repo2 = new MessageRepository(connectionString);
+        await using (var server2 = new BrokerServer(port: brokerPort2, amqpPort: amqpPort2, repo: repo2, monitorPort: monitorPort2))
+        {
+            using var cts = new CancellationTokenSource();
+            await server2.StartAsync(cts.Token);
+            await Task.Delay(250);
+
+            using (var monitor = new HttpClient())
+            {
+                var rmqz = await monitor.GetStringAsync($"http://127.0.0.1:{monitorPort2}/rmqz");
+                using var doc = JsonDocument.Parse(rmqz);
+                var queue = doc.RootElement.GetProperty("queues")
+                    .EnumerateArray()
+                    .FirstOrDefault(x => x.TryGetProperty("name", out var name) && name.GetString() == "amqp.stream.reset.q");
+                Assert.True(queue.ValueKind != JsonValueKind.Undefined, rmqz);
+                Assert.True(queue.GetProperty("messages").GetInt32() >= 2, rmqz);
+            }
+
+            Assert.Equal(0L, await repo2.GetRabbitStreamConsumerOffsetAsync("/", "amqp.stream.reset.q", "stream-reset-consumer"));
+
+            var factory = new ConnectionFactory
+            {
+                HostName = "127.0.0.1",
+                Port = amqpPort2,
+                UserName = "guest",
+                Password = "guest",
+                VirtualHost = "/",
+                DispatchConsumersAsync = true
+            };
+
+            using var connection = factory.CreateConnection();
+            using var channel = connection.CreateModel();
+            var replayed = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var consumer = new AsyncEventingBasicConsumer(channel);
+            consumer.Received += async (_, ea) =>
+            {
+                replayed.TrySetResult(Encoding.UTF8.GetString(ea.Body.ToArray()));
+                channel.BasicAck(ea.DeliveryTag, false);
+                await Task.CompletedTask;
+            };
+
+            channel.BasicConsume(
+                "amqp.stream.reset.q",
+                autoAck: false,
+                consumerTag: "stream-reset-consumer",
+                noLocal: false,
+                exclusive: false,
+                arguments: null,
+                consumer: consumer);
+
+            Assert.Equal("reset-a", await replayed.Task.WaitAsync(TimeSpan.FromSeconds(5)));
         }
 
         try { File.Delete(dbPath); } catch { }

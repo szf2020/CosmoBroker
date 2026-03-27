@@ -83,6 +83,7 @@ public sealed class ExchangeManager
         var resolvedArgs = args ?? new RabbitQueueArgs { Durable = true };
         var key = QueueKey(resolvedVhost, name);
         var queue = Queues.GetOrAdd(key, _ => new RabbitQueue(resolvedVhost, name, resolvedArgs));
+        queue.RetentionDropHandler = DeletePersistedMessage;
         if (!string.IsNullOrEmpty(ownerId) && !queue.TryClaimExclusiveOwner(ownerId, out var error))
             throw new InvalidOperationException(error);
         if (_repo != null && queue.Durable)
@@ -290,14 +291,34 @@ public sealed class ExchangeManager
     public void Consume(string queueName, string consumerTag, Func<RabbitMessage, bool> onMessage, int prefetchCount = 0, bool autoAck = false, string? ownerId = null, Action<string, string>? cancelHandler = null, bool exclusiveConsumer = false)
         => Consume(DefaultVhost, queueName, consumerTag, onMessage, prefetchCount, autoAck, ownerId, cancelHandler, exclusiveConsumer);
 
-    public void Consume(string vhost, string queueName, string consumerTag, Func<RabbitMessage, bool> onMessage, int prefetchCount = 0, bool autoAck = false, string? ownerId = null, Action<string, string>? cancelHandler = null, bool exclusiveConsumer = false, bool drainImmediately = true)
+    public void Consume(string vhost, string queueName, string consumerTag, Func<RabbitMessage, bool> onMessage, int prefetchCount = 0, bool autoAck = false, string? ownerId = null, Action<string, string>? cancelHandler = null, bool exclusiveConsumer = false, bool drainImmediately = true, RabbitStreamOffsetSpec? streamOffset = null)
     {
         var resolvedVhost = NormalizeVhost(vhost);
         if (!Queues.TryGetValue(QueueKey(resolvedVhost, queueName), out var queue))
             throw new InvalidOperationException($"Queue '{queueName}' does not exist.");
 
+        var resolvedStreamOffset = streamOffset;
+        if (queue.Type == RabbitQueueType.Stream && resolvedStreamOffset == null && _repo != null)
+        {
+            var savedOffset = _repo.GetRabbitStreamConsumerOffsetAsync(resolvedVhost, queueName, consumerTag).GetAwaiter().GetResult();
+            if (savedOffset.HasValue)
+                resolvedStreamOffset = new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Offset, Offset = savedOffset.Value + 1 };
+        }
+
+        Func<RabbitMessage, bool> callback = onMessage;
+        if (queue.Type == RabbitQueueType.Stream && autoAck)
+        {
+            callback = msg =>
+            {
+                bool accepted = onMessage(msg);
+                if (accepted)
+                    PersistStreamConsumerOffset(resolvedVhost, queueName, consumerTag, msg.StreamOffset);
+                return accepted;
+            };
+        }
+
         var registration = new RabbitQueue.ConsumerRegistration(
-            onMessage,
+            callback,
             autoAck,
             autoAck ? DeletePersistedMessage : null,
             ownerId,
@@ -307,12 +328,65 @@ public sealed class ExchangeManager
         if (!queue.TryRegisterConsumer(consumerTag, registration, prefetchCount, out var error))
             throw new InvalidOperationException(error);
 
+        if (queue.Type == RabbitQueueType.Stream)
+            queue.SetStreamOffset(consumerTag, resolvedStreamOffset);
+
         if (drainImmediately)
             queue.DrainToConsumers();
     }
 
     public void CancelConsumer(string queueName, string consumerTag)
         => CancelConsumer(DefaultVhost, queueName, consumerTag);
+
+    public bool TryResetStreamConsumerOffset(string vhost, string queueName, string consumerTag, RabbitStreamOffsetSpec? streamOffset, out string? error, out long nextOffset)
+    {
+        error = null;
+        nextOffset = 0;
+
+        if (string.IsNullOrWhiteSpace(consumerTag))
+        {
+            error = "Consumer tag is required.";
+            return false;
+        }
+
+        var resolvedVhost = NormalizeVhost(vhost);
+        if (!Queues.TryGetValue(QueueKey(resolvedVhost, queueName), out var queue))
+        {
+            error = $"Queue '{queueName}' does not exist.";
+            return false;
+        }
+
+        if (queue.Type != RabbitQueueType.Stream)
+        {
+            error = $"Queue '{queueName}' is not a stream queue.";
+            return false;
+        }
+
+        nextOffset = queue.ResolveRequestedStreamOffset(streamOffset);
+        var normalizedOffset = new RabbitStreamOffsetSpec
+        {
+            Kind = RabbitStreamOffsetKind.Offset,
+            Offset = nextOffset
+        };
+
+        bool hasActiveConsumer = queue.Consumers.ContainsKey(consumerTag);
+        if (!hasActiveConsumer && _repo == null)
+        {
+            error = $"Consumer '{consumerTag}' is not active and no repository is configured to persist the reset offset.";
+            return false;
+        }
+
+        if (hasActiveConsumer)
+        {
+            queue.SetStreamOffset(consumerTag, normalizedOffset);
+            queue.DrainToConsumers();
+        }
+
+        if (_repo != null)
+            PersistStreamConsumerOffset(resolvedVhost, queueName, consumerTag, Math.Max(0, nextOffset - 1));
+
+        return true;
+    }
 
     public void CancelConsumer(string vhost, string queueName, string consumerTag)
     {
@@ -340,12 +414,20 @@ public sealed class ExchangeManager
             foreach (var tag in toAck)
             {
                 if (queue.TryRemoveUnacked(tag, out var entry))
-                    DeletePersistedMessage(entry.Msg);
+                {
+                    if (queue.Type == RabbitQueueType.Stream)
+                        PersistStreamConsumerOffset(NormalizeVhost(vhost), queueName, entry.ConsumerTag, entry.Msg.StreamOffset);
+                    if (queue.Type != RabbitQueueType.Stream)
+                        DeletePersistedMessage(entry.Msg);
+                }
             }
         }
         else if (queue.TryRemoveUnacked(deliveryTag, out var entry))
         {
-            DeletePersistedMessage(entry.Msg);
+            if (queue.Type == RabbitQueueType.Stream)
+                PersistStreamConsumerOffset(NormalizeVhost(vhost), queueName, entry.ConsumerTag, entry.Msg.StreamOffset);
+            if (queue.Type != RabbitQueueType.Stream)
+                DeletePersistedMessage(entry.Msg);
         }
 
         queue.DrainToConsumers();
@@ -370,12 +452,21 @@ public sealed class ExchangeManager
 
             if (requeue)
             {
-                queue.Requeue(msg);
+                if (queue.Type == RabbitQueueType.Stream)
+                {
+                    msg.Redelivered = true;
+                    queue.ResetStreamOffset(entry.ConsumerTag, msg.StreamOffset);
+                }
+                else
+                {
+                    queue.Requeue(msg);
+                }
             }
             else
             {
                 DeadLetter(queue, msg, "nack");
-                DeletePersistedMessage(msg);
+                if (queue.Type != RabbitQueueType.Stream)
+                    DeletePersistedMessage(msg);
             }
         }
 
@@ -516,8 +607,20 @@ public sealed class ExchangeManager
                 vhost = queue.Vhost,
                 name = queue.Name,
                 messages = queue.Count,
+                bytes = queue.Type == RabbitQueueType.Stream ? queue.StreamBytes : 0,
                 consumers = queue.Consumers.Count,
                 unacked = queue.Unacked.Count,
+                queue_type = queue.Type.ToString().ToLowerInvariant(),
+                stream_head_offset = queue.Type == RabbitQueueType.Stream ? queue.StreamHeadOffset : 0,
+                stream_tail_offset = queue.Type == RabbitQueueType.Stream ? queue.StreamTailOffset : 0,
+                stream_max_length_bytes = queue.StreamMaxLengthBytes,
+                stream_max_age_ms = queue.StreamMaxAgeMs,
+                stream_offsets = queue.Type == RabbitQueueType.Stream
+                    ? queue.GetStreamOffsetsSnapshot()
+                    : new Dictionary<string, long>(),
+                stream_consumer_lag = queue.Type == RabbitQueueType.Stream
+                    ? queue.GetStreamConsumerLagSnapshot()
+                    : new Dictionary<string, long>(),
                 durable = queue.Durable,
                 dlx = queue.DeadLetterExchange,
                 max_priority = queue.MaxPriority
@@ -576,6 +679,7 @@ public sealed class ExchangeManager
             EnsureBuiltInExchanges(queue.Vhost);
             Queues[QueueKey(queue.Vhost, queue.Name)] = new RabbitQueue(queue.Vhost, queue.Name, new RabbitQueueArgs
             {
+                Type = queue.Type,
                 Durable = queue.Durable,
                 Exclusive = queue.Exclusive,
                 AutoDelete = queue.AutoDelete,
@@ -583,7 +687,9 @@ public sealed class ExchangeManager
                 DeadLetterExchange = queue.DeadLetterExchange,
                 DeadLetterRoutingKey = queue.DeadLetterRoutingKey,
                 MessageTtlMs = queue.MessageTtlMs,
-                QueueTtlMs = queue.QueueTtlMs
+                QueueTtlMs = queue.QueueTtlMs,
+                StreamMaxLengthBytes = queue.StreamMaxLengthBytes,
+                StreamMaxAgeMs = queue.StreamMaxAgeMs
             });
         }
 
@@ -621,6 +727,7 @@ public sealed class ExchangeManager
                 Properties = message.Properties,
                 Priority = message.Priority,
                 ExpiresAt = message.ExpiresAt,
+                CreatedAt = message.CreatedAt,
                 DeathCount = message.DeathCount,
                 OriginalExchange = message.OriginalExchange,
                 OriginalRoutingKey = message.OriginalRoutingKey
@@ -633,6 +740,14 @@ public sealed class ExchangeManager
         if (_repo == null || message.PersistedId <= 0) return;
         _repo.DeleteRabbitMessageAsync(message.PersistedId).GetAwaiter().GetResult();
         message.PersistedId = 0;
+    }
+
+    private void PersistStreamConsumerOffset(string vhost, string queueName, string consumerTag, long offset)
+    {
+        if (_repo == null || string.IsNullOrWhiteSpace(consumerTag) || offset < 0)
+            return;
+
+        _repo.UpdateRabbitStreamConsumerOffsetAsync(vhost, queueName, consumerTag, offset).GetAwaiter().GetResult();
     }
 
     private void EnsureBuiltInExchanges(string vhost)

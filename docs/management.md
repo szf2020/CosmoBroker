@@ -33,6 +33,7 @@ HTTP API routes:
 - `/api/leafs`
 - `/api/jetstream`
 - `/api/rabbitmq`
+- `/api/rabbitmq/streams/reset-offset`
 
 ## Start The Broker
 
@@ -107,9 +108,43 @@ Behavior:
 - `/api/health` remains anonymous by default so container healthchecks keep working
 - set `COSMOBROKER_MANAGEMENT_ALLOW_ANONYMOUS_HEALTH=false` if you want health to be protected too
 
+## Stream Operations
+
+The management layer now includes a first operational stream control:
+
+- reset a RabbitMQ-style stream consumer offset
+
+JSON API example:
+
+```bash
+curl -u admin:change-me \
+  -X POST http://127.0.0.1:9091/api/rabbitmq/streams/reset-offset \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "vhost": "/",
+    "queue": "audit.stream.q",
+    "consumer": "audit-reader",
+    "offset": "first"
+  }'
+```
+
+Supported `offset` values:
+
+- `first`
+- `last`
+- `next`
+- a numeric stream offset
+
+The RabbitMQ page also exposes a simple HTML form for the same operation.
+
 ## Operational Notes
 
 - The management app is read-only right now. It reports broker state but does not mutate queues, streams, or connections.
 - RabbitMQ data in the UI comes from the broker's native monitor stats, not from a separate RabbitMQ management plugin.
+- Stream queues are visible in the RabbitMQ view with:
+  - queue type
+  - retained bytes
+  - max-length / max-age retention settings
+  - tracked stream consumer offsets
 - If the broker monitor endpoint is unavailable, the UI shows that health failure instead of stale data.
 - The sample seeder under [`tools/ManagementSeeder`](../tools/ManagementSeeder) is intended for local demos and manual testing, not production deployment.

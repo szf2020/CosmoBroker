@@ -35,7 +35,7 @@ else
         <div class="stat-card">
             <span>RabbitMQ Queues</span>
             <strong>@_snapshot.rmqz.queues.Count</strong>
-            <small>Unacked: @_snapshot.rmqz.queues.Sum(x => x.unacked)</small>
+            <small>Streams: @_snapshot.rmqz.queues.Count(x => string.Equals(x.queue_type, "stream", StringComparison.OrdinalIgnoreCase)), lag: @_snapshot.rmqz.queues.Sum(MaxStreamLag)</small>
         </div>
         <div class="stat-card">
             <span>Routes / Leafs / Gateways</span>
@@ -95,7 +95,9 @@ else
                     <thead>
                         <tr>
                             <th>Name</th>
+                            <th>Type</th>
                             <th>Messages</th>
+                            <th>Bytes</th>
                             <th>Consumers</th>
                             <th>Unacked</th>
                         </tr>
@@ -105,7 +107,9 @@ else
                         {
                             <tr>
                                 <td>@queue.name</td>
+                                <td>@FormatQueueType(queue)</td>
                                 <td>@queue.messages</td>
+                                <td>@FormatBytes(queue.bytes)</td>
                                 <td>@queue.consumers</td>
                                 <td>@queue.unacked</td>
                             </tr>
@@ -136,4 +140,10 @@ else
             return $"{bytes / 1024d:F2} KB";
         return $"{bytes} B";
     }
+
+    private static string FormatQueueType(RabbitQueueStats queue)
+        => string.IsNullOrWhiteSpace(queue.queue_type) ? "classic" : queue.queue_type!;
+
+    private static long MaxStreamLag(RabbitQueueStats queue)
+        => queue.stream_consumer_lag.Count == 0 ? 0 : queue.stream_consumer_lag.Values.Max();
 }

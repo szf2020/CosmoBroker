@@ -16,6 +16,7 @@ public sealed class RabbitQueue
 
     public string Vhost { get; }
     public string Name { get; }
+    public RabbitQueueType Type { get; init; } = RabbitQueueType.Classic;
     public bool Durable { get; init; }
     public bool Exclusive { get; init; }
     public bool AutoDelete { get; init; }
@@ -34,20 +35,26 @@ public sealed class RabbitQueue
 
     /// <summary>x-expires — queue TTL in milliseconds (queue auto-deletes when unused).</summary>
     public int? QueueTtlMs { get; init; }
+    public long? StreamMaxLengthBytes { get; init; }
+    public long? StreamMaxAgeMs { get; init; }
 
     // --- State ---------------------------------------------------------------
 
     // For priority queues we use a sorted structure; otherwise a simple queue.
     private readonly SortedSet<RabbitMessage>? _priorityQueue;
     private readonly Queue<RabbitMessage>? _queue;
+    private readonly List<RabbitMessage>? _stream;
     private readonly Queue<RabbitMessage> _requeued = new();
     private readonly object _dequeueLock = new();
     private int _retryScheduled;
     private int _drainActive;
+    private long _streamTailOffset;
+    private long _streamBytes;
 
     // delivery-tag → unacked messages per consumer
     public ConcurrentDictionary<ulong, (RabbitMessage Msg, string ConsumerTag)> Unacked { get; } = new();
     private readonly ConcurrentDictionary<string, int> _inFlightByConsumer = new();
+    private readonly ConcurrentDictionary<string, long> _nextOffsetByConsumer = new();
 
     // prefetch_count per consumer tag (0 = unlimited)
     public ConcurrentDictionary<string, int> PrefetchCount { get; } = new();
@@ -62,6 +69,7 @@ public sealed class RabbitQueue
     public DateTime LastUsed { get; private set; } = DateTime.UtcNow;
     public string? ExclusiveOwner { get; private set; }
     public string? ExclusiveConsumerTag { get; private set; }
+    public Action<RabbitMessage>? RetentionDropHandler { get; set; }
 
     public readonly record struct ConsumerRegistration(
         Func<RabbitMessage, bool> Callback,
@@ -95,6 +103,7 @@ public sealed class RabbitQueue
         Vhost = string.IsNullOrWhiteSpace(vhost) ? "/" : vhost;
         Name = name;
         Durable = args.Durable;
+        Type = args.Type;
         Exclusive = args.Exclusive;
         AutoDelete = args.AutoDelete;
         MaxPriority = args.MaxPriority;
@@ -102,8 +111,12 @@ public sealed class RabbitQueue
         DeadLetterRoutingKey = args.DeadLetterRoutingKey;
         MessageTtlMs = args.MessageTtlMs;
         QueueTtlMs = args.QueueTtlMs;
+        StreamMaxLengthBytes = args.StreamMaxLengthBytes;
+        StreamMaxAgeMs = args.StreamMaxAgeMs;
 
-        if (MaxPriority > 0)
+        if (Type == RabbitQueueType.Stream)
+            _stream = new List<RabbitMessage>();
+        else if (MaxPriority > 0)
             _priorityQueue = new SortedSet<RabbitMessage>(PriorityMessageComparer.Instance);
         else
             _queue = new Queue<RabbitMessage>();
@@ -136,14 +149,32 @@ public sealed class RabbitQueue
                 OriginalExchange = message.OriginalExchange,
                 OriginalRoutingKey = message.OriginalRoutingKey,
                 PersistedId = message.PersistedId,
+                StreamOffset = message.StreamOffset,
+                CreatedAt = message.CreatedAt,
                 Properties = message.Properties
             };
         }
 
+        List<RabbitMessage>? trimmed = null;
         lock (_dequeueLock)
         {
-            if (_priorityQueue != null) _priorityQueue.Add(msg);
+            if (_stream != null)
+            {
+                if (msg.StreamOffset <= 0)
+                    msg.StreamOffset = message.PersistedId > 0 ? message.PersistedId : Interlocked.Increment(ref _streamTailOffset);
+                _streamTailOffset = Math.Max(_streamTailOffset, msg.StreamOffset);
+                _stream.Add(msg);
+                _streamBytes += msg.Payload.LongLength;
+                trimmed = TrimStreamRetentionLocked();
+            }
+            else if (_priorityQueue != null) _priorityQueue.Add(msg);
             else _queue!.Enqueue(msg);
+        }
+
+        if (trimmed != null)
+        {
+            foreach (var trimmedMessage in trimmed)
+                RetentionDropHandler?.Invoke(trimmedMessage);
         }
 
         // Dispatch immediately to push consumers respecting prefetch.
@@ -159,6 +190,12 @@ public sealed class RabbitQueue
 
     public bool TryDequeue(out RabbitMessage? message)
     {
+        if (_stream != null)
+        {
+            message = null;
+            return false;
+        }
+
         lock (_dequeueLock)
         {
             if (_requeued.Count > 0)
@@ -207,11 +244,37 @@ public sealed class RabbitQueue
         get
         {
             lock (_dequeueLock)
-                return _requeued.Count + (_priorityQueue?.Count ?? 0) + (_queue?.Count ?? 0);
+                return (_stream?.Count ?? 0) + _requeued.Count + (_priorityQueue?.Count ?? 0) + (_queue?.Count ?? 0);
         }
     }
 
     public long NextPublishSeq() => Interlocked.Increment(ref _publishSeq);
+    public long StreamBytes
+    {
+        get
+        {
+            lock (_dequeueLock)
+                return _streamBytes;
+        }
+    }
+
+    public long StreamHeadOffset
+    {
+        get
+        {
+            lock (_dequeueLock)
+                return _stream is { Count: > 0 } ? _stream[0].StreamOffset : _streamTailOffset + 1;
+        }
+    }
+
+    public long StreamTailOffset
+    {
+        get
+        {
+            lock (_dequeueLock)
+                return _streamTailOffset;
+        }
+    }
 
     public bool TryClaimExclusiveOwner(string? ownerId, out string? error)
     {
@@ -283,6 +346,8 @@ public sealed class RabbitQueue
 
         Consumers[consumerTag] = registration;
         _inFlightByConsumer.TryAdd(consumerTag, 0);
+        if (_stream != null)
+            _nextOffsetByConsumer.TryAdd(consumerTag, _streamTailOffset + 1);
         LastUsed = DateTime.UtcNow;
         return true;
     }
@@ -302,10 +367,18 @@ public sealed class RabbitQueue
         foreach (var (tag, msg) in requeue)
         {
             TryRemoveUnacked(tag, out _);
-            lock (_dequeueLock)
+            if (_stream != null)
             {
                 msg.Redelivered = true;
-                RequeueCore(msg);
+                _nextOffsetByConsumer.AddOrUpdate(consumerTag, _ => msg.StreamOffset, (_, current) => Math.Min(current, msg.StreamOffset));
+            }
+            else
+            {
+                lock (_dequeueLock)
+                {
+                    msg.Redelivered = true;
+                    RequeueCore(msg);
+                }
             }
         }
 
@@ -324,7 +397,9 @@ public sealed class RabbitQueue
                 ExclusiveConsumerTag = null;
         }
 
-        if (requeue.Count > 0)
+        _nextOffsetByConsumer.TryRemove(consumerTag, out _);
+
+        if (_stream == null && requeue.Count > 0)
             ScheduleRetry();
 
         return registration;
@@ -334,6 +409,12 @@ public sealed class RabbitQueue
 
     private void DispatchToConsumers()
     {
+        if (_stream != null)
+        {
+            DispatchStreamToConsumers();
+            return;
+        }
+
         if (Interlocked.CompareExchange(ref _drainActive, 1, 0) != 0)
             return;
 
@@ -418,6 +499,72 @@ public sealed class RabbitQueue
             ScheduleRetry();
     }
 
+    private void DispatchStreamToConsumers()
+    {
+        if (Interlocked.CompareExchange(ref _drainActive, 1, 0) != 0)
+            return;
+
+        try
+        {
+            while (true)
+            {
+                bool deliveredAny = false;
+
+                foreach (var (tag, registration) in Consumers)
+                {
+                    int limit = registration.AutoAck ? 0 : PrefetchCount.GetValueOrDefault(tag, 0);
+                    while (true)
+                    {
+                        int inFlight = registration.AutoAck ? 0 : GetInFlightCount(tag);
+                        if (limit > 0 && inFlight >= limit)
+                            break;
+
+                        if (!TryPeekNextStreamMessage(tag, out var msg) || msg == null)
+                            break;
+
+                        bool tracked = false;
+                        if (!registration.AutoAck)
+                        {
+                            TrackUnacked(msg, tag);
+                            tracked = true;
+                        }
+
+                        bool accepted;
+                        try
+                        {
+                            accepted = registration.Callback(msg);
+                        }
+                        catch
+                        {
+                            accepted = false;
+                        }
+
+                        if (!accepted)
+                        {
+                            if (tracked)
+                                TryRemoveUnacked(msg.DeliveryTag, out _);
+
+                            msg.Redelivered = true;
+                            _nextOffsetByConsumer[tag] = msg.StreamOffset;
+                            ScheduleRetry();
+                            break;
+                        }
+
+                        _nextOffsetByConsumer[tag] = msg.StreamOffset + 1;
+                        deliveredAny = true;
+                    }
+                }
+
+                if (!deliveredAny)
+                    break;
+            }
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _drainActive, 0);
+        }
+    }
+
     // Trigger dispatch externally (e.g. after ack frees a prefetch slot)
     public void DrainToConsumers() => DispatchToConsumers();
 
@@ -427,6 +574,23 @@ public sealed class RabbitQueue
         int purged = 0;
         lock (_dequeueLock)
         {
+            if (_stream != null)
+            {
+                for (int i = _stream.Count - 1; i >= 0; i--)
+                {
+                    var msg = _stream[i];
+                    if (!msg.IsExpired)
+                        continue;
+
+                    _stream.RemoveAt(i);
+                    _streamBytes -= msg.Payload.LongLength;
+                    purged++;
+                    onExpired?.Invoke(msg);
+                }
+
+                return purged;
+            }
+
             int requeuedCount = _requeued.Count;
             for (int i = 0; i < requeuedCount; i++)
             {
@@ -460,6 +624,19 @@ public sealed class RabbitQueue
         int purged = 0;
         lock (_dequeueLock)
         {
+            if (_stream != null)
+            {
+                foreach (var msg in _stream)
+                {
+                    if (onPurged?.Invoke(msg) ?? true) { }
+                    purged++;
+                }
+
+                _stream.Clear();
+                _streamBytes = 0;
+                return purged;
+            }
+
             while (_requeued.Count > 0)
             {
                 var msg = _requeued.Dequeue();
@@ -527,7 +704,7 @@ public sealed class RabbitQueue
     private bool HasQueuedMessages()
     {
         lock (_dequeueLock)
-            return _requeued.Count > 0 || (_priorityQueue?.Count ?? 0) > 0 || (_queue?.Count ?? 0) > 0;
+            return (_stream?.Count ?? 0) > 0 || _requeued.Count > 0 || (_priorityQueue?.Count ?? 0) > 0 || (_queue?.Count ?? 0) > 0;
     }
 
     public void TrackUnacked(RabbitMessage msg, string consumerTag)
@@ -551,6 +728,163 @@ public sealed class RabbitQueue
     public int GetInFlightCount(string consumerTag)
         => _inFlightByConsumer.TryGetValue(consumerTag, out var count) ? count : 0;
 
+    public IReadOnlyDictionary<string, long> GetStreamOffsetsSnapshot()
+    {
+        if (_stream == null)
+            return new Dictionary<string, long>();
+
+        lock (_dequeueLock)
+            return new Dictionary<string, long>(_nextOffsetByConsumer);
+    }
+
+    public IReadOnlyDictionary<string, long> GetStreamConsumerLagSnapshot()
+    {
+        if (_stream == null)
+            return new Dictionary<string, long>();
+
+        lock (_dequeueLock)
+        {
+            var snapshot = new Dictionary<string, long>(_nextOffsetByConsumer.Count, StringComparer.Ordinal);
+            foreach (var (consumerTag, nextOffset) in _nextOffsetByConsumer)
+            {
+                long lag = _streamTailOffset >= nextOffset
+                    ? (_streamTailOffset - nextOffset) + 1
+                    : 0;
+                snapshot[consumerTag] = lag;
+            }
+
+            return snapshot;
+        }
+    }
+
+    public void SetStreamOffset(string consumerTag, RabbitStreamOffsetSpec? offset)
+    {
+        if (_stream == null)
+            return;
+
+        _nextOffsetByConsumer[consumerTag] = ResolveStreamOffset(offset);
+    }
+
+    public long ResolveRequestedStreamOffset(RabbitStreamOffsetSpec? offset)
+    {
+        if (_stream == null)
+            return 0;
+
+        return ResolveStreamOffset(offset);
+    }
+
+    public bool TryGetStreamMessage(string consumerTag, out RabbitMessage? message)
+    {
+        if (_stream == null)
+        {
+            message = null;
+            return false;
+        }
+
+        if (!TryPeekNextStreamMessage(consumerTag, out message) || message == null)
+            return false;
+
+        _nextOffsetByConsumer[consumerTag] = message.StreamOffset + 1;
+        LastUsed = DateTime.UtcNow;
+        return true;
+    }
+
+    public void ResetStreamOffset(string consumerTag, long streamOffset)
+    {
+        if (_stream == null)
+            return;
+
+        _nextOffsetByConsumer.AddOrUpdate(consumerTag, _ => streamOffset, (_, current) => Math.Min(current, streamOffset));
+    }
+
+    private bool TryPeekNextStreamMessage(string consumerTag, out RabbitMessage? message)
+    {
+        message = null;
+        if (_stream == null)
+            return false;
+
+        lock (_dequeueLock)
+        {
+            var nextOffset = _nextOffsetByConsumer.TryGetValue(consumerTag, out var currentOffset)
+                ? currentOffset
+                : _streamTailOffset + 1;
+
+            for (int i = 0; i < _stream.Count; i++)
+            {
+                var candidate = _stream[i];
+                if (candidate.StreamOffset < nextOffset)
+                    continue;
+
+                if (candidate.IsExpired)
+                {
+                    nextOffset = candidate.StreamOffset + 1;
+                    _nextOffsetByConsumer[consumerTag] = nextOffset;
+                    continue;
+                }
+
+                message = candidate;
+                LastUsed = DateTime.UtcNow;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private long ResolveStreamOffset(RabbitStreamOffsetSpec? spec)
+    {
+        lock (_dequeueLock)
+        {
+            if (_stream == null)
+                return 0;
+
+            if (_stream.Count == 0)
+                return _streamTailOffset + 1;
+
+            return spec?.Kind switch
+            {
+                RabbitStreamOffsetKind.First => _stream[0].StreamOffset,
+                RabbitStreamOffsetKind.Last => _stream[^1].StreamOffset,
+                RabbitStreamOffsetKind.Next => _streamTailOffset + 1,
+                RabbitStreamOffsetKind.Offset when spec.Offset.HasValue => spec.Offset.Value,
+                _ => _streamTailOffset + 1
+            };
+        }
+    }
+
+    private List<RabbitMessage>? TrimStreamRetentionLocked()
+    {
+        if (_stream == null || _stream.Count == 0)
+            return null;
+
+        List<RabbitMessage>? removed = null;
+        while (_stream.Count > 0)
+        {
+            bool remove = false;
+            var candidate = _stream[0];
+
+            if (StreamMaxAgeMs.HasValue)
+            {
+                var ageMs = (DateTime.UtcNow - candidate.CreatedAt).TotalMilliseconds;
+                if (ageMs > StreamMaxAgeMs.Value)
+                    remove = true;
+            }
+
+            if (!remove && StreamMaxLengthBytes.HasValue && _streamBytes > StreamMaxLengthBytes.Value)
+                remove = true;
+
+            if (!remove)
+                break;
+
+            _stream.RemoveAt(0);
+            _streamBytes -= candidate.Payload.LongLength;
+            removed ??= new List<RabbitMessage>();
+            removed.Add(candidate);
+        }
+
+        return removed;
+    }
+
     // --- Comparers -----------------------------------------------------------
 
     private sealed class PriorityMessageComparer : IComparer<RabbitMessage>
@@ -571,9 +905,30 @@ public sealed class RabbitQueue
     }
 }
 
+public enum RabbitQueueType
+{
+    Classic = 0,
+    Stream = 1
+}
+
+public enum RabbitStreamOffsetKind
+{
+    Next = 0,
+    First = 1,
+    Last = 2,
+    Offset = 3
+}
+
+public sealed class RabbitStreamOffsetSpec
+{
+    public RabbitStreamOffsetKind Kind { get; set; } = RabbitStreamOffsetKind.Next;
+    public long? Offset { get; set; }
+}
+
 /// <summary>Arguments bag for queue declaration.</summary>
 public sealed class RabbitQueueArgs
 {
+    public RabbitQueueType Type { get; set; } = RabbitQueueType.Classic;
     public bool Durable { get; set; }
     public bool Exclusive { get; set; }
     public bool AutoDelete { get; set; }
@@ -582,4 +937,6 @@ public sealed class RabbitQueueArgs
     public string? DeadLetterRoutingKey { get; set; }
     public int? MessageTtlMs { get; set; }
     public int? QueueTtlMs { get; set; }
+    public long? StreamMaxLengthBytes { get; set; }
+    public long? StreamMaxAgeMs { get; set; }
 }

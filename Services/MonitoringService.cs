@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using CosmoBroker.RabbitMQ;
 
 namespace CosmoBroker.Services;
 
@@ -59,8 +60,20 @@ public class MonitoringService
             string[] parts = line.Split(' ');
             if (parts.Length < 2) return;
 
-            string path = parts[1];
+            string method = parts[0];
+            string rawTarget = parts[1];
+            string path = rawTarget;
+            var query = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            int queryIndex = rawTarget.IndexOf('?');
+            if (queryIndex >= 0)
+            {
+                path = rawTarget[..queryIndex];
+                query = ParseQueryString(rawTarget[(queryIndex + 1)..]);
+            }
+
             object? responseData = null;
+            int statusCode = 200;
+            string reasonPhrase = "OK";
 
             if (path == "/varz")
             {
@@ -90,15 +103,54 @@ public class MonitoringService
             {
                 responseData = _server.GetRmqz();
             }
+            else if (string.Equals(method, "POST", StringComparison.OrdinalIgnoreCase) && path == "/rmq/stream/reset")
+            {
+                string vhost = query.TryGetValue("vhost", out var vhostValue) && !string.IsNullOrWhiteSpace(vhostValue)
+                    ? vhostValue
+                    : "/";
+                string queue = query.TryGetValue("queue", out var queueValue) ? queueValue : string.Empty;
+                string consumer = query.TryGetValue("consumer", out var consumerValue) ? consumerValue : string.Empty;
+                string? offsetText = query.TryGetValue("offset", out var offsetValue) ? offsetValue : null;
+
+                if (string.IsNullOrWhiteSpace(queue) || string.IsNullOrWhiteSpace(consumer))
+                {
+                    statusCode = 400;
+                    reasonPhrase = "Bad Request";
+                    responseData = new { ok = false, error = "Queue and consumer are required." };
+                }
+                else
+                {
+                    var streamOffset = ParseStreamOffset(offsetText);
+                    if (_server.TryResetRabbitStreamOffset(vhost, queue, consumer, streamOffset, out var error, out var nextOffset))
+                    {
+                        responseData = new
+                        {
+                            ok = true,
+                            vhost,
+                            queue,
+                            consumer,
+                            next_offset = nextOffset
+                        };
+                    }
+                    else
+                    {
+                        statusCode = 400;
+                        reasonPhrase = "Bad Request";
+                        responseData = new { ok = false, error = error ?? "Unable to reset stream offset." };
+                    }
+                }
+            }
             else
             {
                 responseData = new { error = "Not Found", paths = new[] { "/varz", "/connz", "/routez", "/leafz", "/gatewayz", "/jsz", "/rmqz" } };
+                statusCode = 404;
+                reasonPhrase = "Not Found";
             }
 
             string json = JsonSerializer.Serialize(responseData, new JsonSerializerOptions { WriteIndented = true });
             byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
 
-            string headers = "HTTP/1.1 200 OK\r\n" +
+            string headers = $"HTTP/1.1 {statusCode} {reasonPhrase}\r\n" +
                              "Content-Type: application/json\r\n" +
                              $"Content-Length: {jsonBytes.Length}\r\n" +
                              "Connection: close\r\n\r\n";
@@ -108,5 +160,40 @@ public class MonitoringService
             await stream.FlushAsync();
         }
         catch { }
+    }
+
+    private static Dictionary<string, string> ParseQueryString(string queryString)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(queryString))
+            return result;
+
+        foreach (var part in queryString.Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var pieces = part.Split('=', 2);
+            var key = WebUtility.UrlDecode(pieces[0]);
+            var value = pieces.Length > 1 ? WebUtility.UrlDecode(pieces[1]) : string.Empty;
+            if (!string.IsNullOrWhiteSpace(key))
+                result[key] = value;
+        }
+
+        return result;
+    }
+
+    private static RabbitStreamOffsetSpec? ParseStreamOffset(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        if (long.TryParse(value, out var numericOffset))
+            return new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Offset, Offset = numericOffset };
+
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "first" => new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.First },
+            "last" => new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Last },
+            "next" => new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Next },
+            _ => null
+        };
     }
 }

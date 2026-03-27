@@ -108,6 +108,41 @@ app.MapGet("/api/rabbitmq", async ctx =>
     ctx.Response.WriteJson(rabbitMq);
 });
 
+app.MapPost("/api/rabbitmq/streams/reset-offset", async ctx =>
+{
+    var client = ctx.RequestServices.GetRequiredService<BrokerMonitorClient>();
+    var request = ctx.Request.ReadJson<StreamOffsetResetRequest>() ?? new StreamOffsetResetRequest();
+    var result = await client.ResetStreamOffsetAsync(request, ctx.RequestAborted);
+    if (!result.ok)
+    {
+        ctx.Response.StatusCode = 400;
+        ctx.Response.ReasonPhrase = "Bad Request";
+    }
+    ctx.Response.WriteJson(result);
+});
+
+app.MapPost("/rabbitmq/streams/reset-offset", async ctx =>
+{
+    var client = ctx.RequestServices.GetRequiredService<BrokerMonitorClient>();
+    var form = ctx.Request.ReadForm();
+    var request = new StreamOffsetResetRequest
+    {
+        vhost = form.Fields.TryGetValue("vhost", out var vhost) && !string.IsNullOrWhiteSpace(vhost) ? vhost : "/",
+        queue = form.Fields.TryGetValue("queue", out var queue) ? queue : string.Empty,
+        consumer = form.Fields.TryGetValue("consumer", out var consumer) ? consumer : string.Empty,
+        offset = form.Fields.TryGetValue("offset", out var offset) && !string.IsNullOrWhiteSpace(offset) ? offset : "next"
+    };
+
+    var result = await client.ResetStreamOffsetAsync(request, ctx.RequestAborted);
+    var message = result.ok
+        ? $"Reset {request.consumer} on {request.queue} to next offset {result.next_offset}."
+        : (result.error ?? "Unable to reset stream offset.");
+    var query = $"status={(result.ok ? "ok" : "error")}&message={Uri.EscapeDataString(message)}";
+    ctx.Response.StatusCode = 302;
+    ctx.Response.ReasonPhrase = "Found";
+    ctx.Response.Headers["Location"] = $"/rabbitmq?{query}";
+});
+
 Console.WriteLine($"CosmoBroker.Management running on http://localhost:{managementPort}");
 Console.WriteLine($"Tracking broker monitor endpoint: {monitorBaseUrl}");
 app.Run();

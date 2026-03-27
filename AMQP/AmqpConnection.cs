@@ -326,6 +326,7 @@ internal sealed class AmqpConnection : IAsyncDisposable
                 _ = ReadBit(ref payload, 4);
                 bool queueDeclareNoWait = ReadBit(ref payload, 5);
                 var arguments = AmqpWire.ReadTable(ref payload);
+                var queueType = ParseQueueType(GetStringArg(arguments, "x-queue-type"));
                 bool generatedQueue = false;
                 if (string.IsNullOrEmpty(queueName))
                 {
@@ -370,14 +371,17 @@ internal sealed class AmqpConnection : IAsyncDisposable
                     }
                     var existingQueue = _manager.GetQueue(_vhost, queueName);
                     if (existingQueue != null &&
-                        (existingQueue.Durable != qDurable ||
+                        (existingQueue.Type != queueType ||
+                         existingQueue.Durable != qDurable ||
                          existingQueue.Exclusive != exclusive ||
                          existingQueue.AutoDelete != qAutoDelete ||
                          existingQueue.MaxPriority != GetByteArg(arguments, "x-max-priority") ||
                          !string.Equals(existingQueue.DeadLetterExchange, GetStringArg(arguments, "x-dead-letter-exchange"), StringComparison.Ordinal) ||
                          !string.Equals(existingQueue.DeadLetterRoutingKey, GetStringArg(arguments, "x-dead-letter-routing-key"), StringComparison.Ordinal) ||
                          existingQueue.MessageTtlMs != GetIntArg(arguments, "x-message-ttl") ||
-                         existingQueue.QueueTtlMs != GetIntArg(arguments, "x-expires")))
+                         existingQueue.QueueTtlMs != GetIntArg(arguments, "x-expires") ||
+                         existingQueue.StreamMaxLengthBytes != GetLongArg(arguments, "x-max-length-bytes") ||
+                         existingQueue.StreamMaxAgeMs != ParseDurationMs(GetStringArg(arguments, "x-max-age"))))
                     {
                         await SendChannelCloseAsync(channelNumber, 406, $"Queue '{queueName}' redeclared with different properties", classId, methodId, ct);
                         return;
@@ -386,6 +390,7 @@ internal sealed class AmqpConnection : IAsyncDisposable
                     {
                         queue = _manager.DeclareQueue(_vhost, queueName, new RabbitQueueArgs
                         {
+                            Type = queueType,
                             Durable = qDurable,
                             Exclusive = exclusive,
                             AutoDelete = qAutoDelete,
@@ -393,7 +398,9 @@ internal sealed class AmqpConnection : IAsyncDisposable
                             DeadLetterExchange = GetStringArg(arguments, "x-dead-letter-exchange"),
                             DeadLetterRoutingKey = GetStringArg(arguments, "x-dead-letter-routing-key"),
                             MessageTtlMs = GetIntArg(arguments, "x-message-ttl"),
-                            QueueTtlMs = GetIntArg(arguments, "x-expires")
+                            QueueTtlMs = GetIntArg(arguments, "x-expires"),
+                            StreamMaxLengthBytes = GetLongArg(arguments, "x-max-length-bytes"),
+                            StreamMaxAgeMs = ParseDurationMs(GetStringArg(arguments, "x-max-age"))
                         }, _sessionId);
                     }
                     catch (InvalidOperationException ex)
@@ -594,7 +601,8 @@ internal sealed class AmqpConnection : IAsyncDisposable
                 bool noAck = ReadBit(ref payload, 1);
                 bool exclusiveConsume = ReadBit(ref payload, 2);
                 bool noWait = ReadBit(ref payload, 3);
-                _ = AmqpWire.ReadTable(ref payload);
+                var consumeArgs = AmqpWire.ReadTable(ref payload);
+                var streamOffset = ParseStreamOffset(GetStreamOffsetArg(consumeArgs, "x-stream-offset"));
 
                 if (noLocal)
                 {
@@ -649,7 +657,7 @@ internal sealed class AmqpConnection : IAsyncDisposable
                         if (_channels.TryGetValue(channelNumber, out var activeState))
                             activeState.Consumers.Remove(tag);
                         SendServerBasicCancelAsync(channelNumber, tag, ct).GetAwaiter().GetResult();
-                    }, exclusiveConsumer: exclusiveConsume, drainImmediately: false);
+                    }, exclusiveConsumer: exclusiveConsume, drainImmediately: false, streamOffset: streamOffset);
                     state.Consumers[consumerTag] = consumeQueue;
                     if (!noWait)
                         await SendMethodAsync(channelNumber, 60, 21, writer => AmqpWire.WriteShortString(writer, consumerTag), ct);
@@ -900,6 +908,12 @@ internal sealed class AmqpConnection : IAsyncDisposable
         if (!queue.IsAccessibleBy(_sessionId))
         {
             await SendChannelCloseAsync(channelNumber, 405, ResourceLockedText(queueName, _vhost), 60, 70, ct);
+            return;
+        }
+
+        if (queue.Type == RabbitQueueType.Stream)
+        {
+            await SendChannelCloseAsync(channelNumber, 540, "NOT_IMPLEMENTED - basic.get is not supported for stream queues", 60, 70, ct);
             return;
         }
 
@@ -1229,6 +1243,105 @@ internal sealed class AmqpConnection : IAsyncDisposable
 
     private static int? GetIntArg(Dictionary<string, object?> args, string key)
         => args.TryGetValue(key, out var value) && value is int i ? i : null;
+
+    private static long? GetLongArg(Dictionary<string, object?> args, string key)
+    {
+        if (!args.TryGetValue(key, out var value) || value == null)
+            return null;
+
+        return value switch
+        {
+            byte b => b,
+            sbyte sb => sb,
+            short s => s,
+            ushort us => us,
+            int i => i,
+            uint ui => ui,
+            long l => l,
+            ulong ul when ul <= long.MaxValue => (long)ul,
+            _ when long.TryParse(value.ToString(), out var parsed) => parsed,
+            _ => null
+        };
+    }
+
+    private static object? GetStreamOffsetArg(Dictionary<string, object?> args, string key)
+        => args.TryGetValue(key, out var value) ? value : null;
+
+    private static RabbitQueueType ParseQueueType(string? value)
+        => string.Equals(value, "stream", StringComparison.OrdinalIgnoreCase)
+            ? RabbitQueueType.Stream
+            : RabbitQueueType.Classic;
+
+    private static RabbitStreamOffsetSpec? ParseStreamOffset(object? value)
+    {
+        if (value == null)
+            return null;
+
+        if (value is byte byteOffset)
+            return new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Offset, Offset = byteOffset };
+        if (value is sbyte sbyteOffset)
+            return new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Offset, Offset = sbyteOffset };
+        if (value is short shortOffset)
+            return new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Offset, Offset = shortOffset };
+        if (value is ushort ushortOffset)
+            return new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Offset, Offset = ushortOffset };
+        if (value is int intOffset)
+            return new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Offset, Offset = intOffset };
+        if (value is uint uintOffset)
+            return new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Offset, Offset = uintOffset };
+        if (value is long longOffset)
+            return new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Offset, Offset = longOffset };
+        if (value is ulong ulongOffset && ulongOffset <= long.MaxValue)
+            return new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Offset, Offset = (long)ulongOffset };
+
+        var text = value.ToString();
+        if (string.IsNullOrWhiteSpace(text))
+            return null;
+
+        if (long.TryParse(text, out var parsedOffset))
+            return new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Offset, Offset = parsedOffset };
+
+        return text.Trim().ToLowerInvariant() switch
+        {
+            "first" => new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.First },
+            "last" => new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Last },
+            "next" => new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Next },
+            _ => null
+        };
+    }
+
+    private static long? ParseDurationMs(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        var text = value.Trim();
+        if (long.TryParse(text, out var rawMs))
+            return rawMs;
+
+        if (TimeSpan.TryParse(text, out var timeSpan))
+            return (long)timeSpan.TotalMilliseconds;
+
+        if (text.EndsWith("ms", StringComparison.OrdinalIgnoreCase) &&
+            long.TryParse(text[..^2], out var explicitMs))
+            return explicitMs;
+
+        if (text.Length < 2)
+            return null;
+
+        var suffix = char.ToLowerInvariant(text[^1]);
+        if (!long.TryParse(text[..^1], out var magnitude))
+            return null;
+
+        return suffix switch
+        {
+            's' => magnitude * 1000L,
+            'm' => magnitude * 60_000L,
+            'h' => magnitude * 3_600_000L,
+            'd' => magnitude * 86_400_000L,
+            _ => null
+        };
+    }
 
     private static Dictionary<string, string>? ToStringDictionary(Dictionary<string, object?>? args)
     {
