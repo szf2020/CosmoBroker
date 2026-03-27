@@ -60,6 +60,8 @@ if [[ ! -f "$SERVER_DLL" ]]; then
   exit 1
 fi
 
+COSMOBROKER_ENABLE_AMQP=true \
+COSMOBROKER_AMQP_PORT="$COSMO_AMQP_PORT" \
 dotnet "$SERVER_DLL" \
   "$COSMO_PORT" "$COSMO_MONITOR_PORT" "$COSMO_AMQP_PORT" \
   >"$ROOT_DIR/benchmarks/cosmobroker-amqp-compare.log" 2>&1 &
