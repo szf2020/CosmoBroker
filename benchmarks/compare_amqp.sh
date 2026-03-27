@@ -11,7 +11,17 @@ PAYLOAD="${PAYLOAD:-128}"
 LATENCY="${LATENCY:-100}"
 TIMEOUT_MS="${TIMEOUT_MS:-3000}"
 REPORT_PATH="${REPORT_PATH:-$ROOT_DIR/benchmarks/amqp-compare-report.txt}"
-SERVER_DLL="${SERVER_DLL:-$ROOT_DIR/CosmoBroker.Server/bin/Debug/net10.0/CosmoBroker.Server.dll}"
+DEFAULT_RELEASE_DLL="$ROOT_DIR/CosmoBroker.Server/bin/Release/net10.0/CosmoBroker.Server.dll"
+DEFAULT_DEBUG_DLL="$ROOT_DIR/CosmoBroker.Server/bin/Debug/net10.0/CosmoBroker.Server.dll"
+SERVER_DLL="${SERVER_DLL:-}"
+
+if [[ -z "$SERVER_DLL" ]]; then
+  if [[ -f "$DEFAULT_RELEASE_DLL" ]]; then
+    SERVER_DLL="$DEFAULT_RELEASE_DLL"
+  else
+    SERVER_DLL="$DEFAULT_DEBUG_DLL"
+  fi
+fi
 
 mkdir -p "$(dirname "$REPORT_PATH")"
 
@@ -45,6 +55,11 @@ PY
 }
 
 echo "Starting CosmoBroker for AMQP comparison..."
+if [[ ! -f "$SERVER_DLL" ]]; then
+  echo "CosmoBroker server binary not found: $SERVER_DLL" >&2
+  exit 1
+fi
+
 dotnet "$SERVER_DLL" \
   "$COSMO_PORT" "$COSMO_MONITOR_PORT" "$COSMO_AMQP_PORT" \
   >"$ROOT_DIR/benchmarks/cosmobroker-amqp-compare.log" 2>&1 &
