@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Data;
+using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -8,6 +10,7 @@ using CosmoSQLClient.Core;
 using CosmoSQLClient.Sqlite;
 using CosmoSQLClient.MsSql;
 using CosmoSQLClient.Postgres;
+using CosmoBroker.RabbitMQ;
 
 namespace CosmoBroker.Persistence;
 
@@ -17,9 +20,16 @@ public class MessageRepository
     private readonly DatabaseProvider _provider;
     private readonly Channel<JetStreamWrite>? _jsWriteChannel;
     private readonly Task? _jsWriteLoop;
+    private readonly Channel<RabbitWrite>? _rmqWriteChannel;
+    private readonly Task? _rmqWriteLoop;
+    private readonly Channel<RabbitDelete>? _rmqDeleteChannel;
+    private readonly Task? _rmqDeleteLoop;
+    private readonly SemaphoreSlim _sqliteRabbitWriteLock = new(1, 1);
 
     private readonly int _jsBatchSize;
     private readonly TimeSpan _jsBatchMaxDelay;
+    private readonly int _rmqBatchSize;
+    private readonly TimeSpan _rmqBatchMaxDelay;
 
     public MessageRepository(
         string connectionString,
@@ -31,15 +41,18 @@ public class MessageRepository
         var resolved = ResolveProvider(connectionString, provider);
         _provider = resolved.Provider;
         var cs = resolved.ConnectionString;
+        int effectiveMaxConnections = _provider == DatabaseProvider.Sqlite ? 1 : maxConnections;
 
         _jsBatchSize = ResolveJetStreamBatchSize(jetStreamBatchSize);
         _jsBatchMaxDelay = ResolveJetStreamBatchDelay(jetStreamBatchDelayMs);
+        _rmqBatchSize = ResolveRabbitBatchSize();
+        _rmqBatchMaxDelay = ResolveRabbitBatchDelay();
 
         _db = _provider switch
         {
-            DatabaseProvider.MsSql => new MsSqlConnectionPool(MsSqlConfiguration.Parse(cs), maxConnections: maxConnections),
-            DatabaseProvider.Postgres => new PostgresConnectionPool(PostgresConfiguration.Parse(cs), maxConnections: maxConnections),
-            _ => new SqliteConnectionPool(SqliteConfiguration.Parse(cs), maxConnections: maxConnections)
+            DatabaseProvider.MsSql => new MsSqlConnectionPool(MsSqlConfiguration.Parse(cs), maxConnections: effectiveMaxConnections),
+            DatabaseProvider.Postgres => new PostgresConnectionPool(PostgresConfiguration.Parse(cs), maxConnections: effectiveMaxConnections),
+            _ => new SqliteConnectionPool(SqliteConfiguration.Parse(cs), maxConnections: effectiveMaxConnections)
         };
 
         if (_provider == DatabaseProvider.Sqlite)
@@ -50,6 +63,20 @@ public class MessageRepository
                 SingleWriter = false
             });
             _jsWriteLoop = Task.Run(JetStreamWriteLoopAsync);
+
+            _rmqWriteChannel = Channel.CreateUnbounded<RabbitWrite>(new UnboundedChannelOptions
+            {
+                SingleReader = true,
+                SingleWriter = false
+            });
+            _rmqWriteLoop = Task.Run(RabbitWriteLoopAsync);
+
+            _rmqDeleteChannel = Channel.CreateUnbounded<RabbitDelete>(new UnboundedChannelOptions
+            {
+                SingleReader = true,
+                SingleWriter = false
+            });
+            _rmqDeleteLoop = Task.Run(RabbitDeleteLoopAsync);
         }
     }
 
@@ -72,6 +99,9 @@ public class MessageRepository
         {
             await _db.ExecuteAsync(stmt, ct: ct);
         }
+
+        await EnsureRabbitMessagePropertyColumnAsync(ct);
+        await EnsureRabbitBindingDestinationKindColumnAsync(ct);
     }
 
     private const string SqliteSchema = @"
@@ -108,10 +138,58 @@ public class MessageRepository
                 allow_sub      TEXT,
                 deny_sub       TEXT
             );
+            CREATE TABLE IF NOT EXISTS mq_rabbit_permissions (
+                username            TEXT PRIMARY KEY,
+                default_vhost       TEXT,
+                allowed_vhosts      TEXT,
+                configure_patterns  TEXT,
+                write_patterns      TEXT,
+                read_patterns       TEXT
+            );
+            CREATE TABLE IF NOT EXISTS rmq_exchanges (
+                name        TEXT PRIMARY KEY,
+                type        TEXT NOT NULL,
+                durable     INTEGER NOT NULL,
+                auto_delete INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS rmq_queues (
+                name                    TEXT PRIMARY KEY,
+                durable                 INTEGER NOT NULL,
+                exclusive               INTEGER NOT NULL,
+                auto_delete             INTEGER NOT NULL,
+                max_priority            INTEGER NOT NULL,
+                dead_letter_exchange    TEXT,
+                dead_letter_routing_key TEXT,
+                message_ttl_ms          INTEGER,
+                queue_ttl_ms            INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS rmq_bindings (
+                exchange_name TEXT NOT NULL,
+                queue_name    TEXT NOT NULL,
+                routing_key   TEXT NOT NULL,
+                destination_kind TEXT NOT NULL DEFAULT 'queue',
+                header_args   TEXT,
+                PRIMARY KEY (exchange_name, queue_name, routing_key)
+            );
+            CREATE TABLE IF NOT EXISTS rmq_messages (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                queue_name            TEXT NOT NULL,
+                routing_key           TEXT NOT NULL,
+                payload               BLOB NOT NULL,
+                headers               TEXT,
+                properties            TEXT,
+                priority              INTEGER NOT NULL,
+                expires_at            TEXT,
+                death_count           INTEGER NOT NULL,
+                original_exchange     TEXT,
+                original_routing_key  TEXT,
+                created_at            DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE INDEX IF NOT EXISTS idx_mq_messages_subject ON mq_messages(subject);
             CREATE INDEX IF NOT EXISTS idx_mq_messages_stream ON mq_messages(stream_name);
             CREATE INDEX IF NOT EXISTS idx_mq_messages_stream_id ON mq_messages(stream_name, id);
-            CREATE INDEX IF NOT EXISTS idx_mq_messages_subject_id ON mq_messages(subject, id);";
+            CREATE INDEX IF NOT EXISTS idx_mq_messages_subject_id ON mq_messages(subject, id);
+            CREATE INDEX IF NOT EXISTS idx_rmq_messages_queue_id ON rmq_messages(queue_name, id);";
 
     private const string PostgresSchema = @"
             CREATE TABLE IF NOT EXISTS mq_messages (
@@ -147,10 +225,58 @@ public class MessageRepository
                 allow_sub      TEXT,
                 deny_sub       TEXT
             );
+            CREATE TABLE IF NOT EXISTS mq_rabbit_permissions (
+                username            TEXT PRIMARY KEY,
+                default_vhost       TEXT,
+                allowed_vhosts      TEXT,
+                configure_patterns  TEXT,
+                write_patterns      TEXT,
+                read_patterns       TEXT
+            );
+            CREATE TABLE IF NOT EXISTS rmq_exchanges (
+                name        TEXT PRIMARY KEY,
+                type        TEXT NOT NULL,
+                durable     BOOLEAN NOT NULL,
+                auto_delete BOOLEAN NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS rmq_queues (
+                name                    TEXT PRIMARY KEY,
+                durable                 BOOLEAN NOT NULL,
+                exclusive               BOOLEAN NOT NULL,
+                auto_delete             BOOLEAN NOT NULL,
+                max_priority            INTEGER NOT NULL,
+                dead_letter_exchange    TEXT,
+                dead_letter_routing_key TEXT,
+                message_ttl_ms          INTEGER,
+                queue_ttl_ms            INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS rmq_bindings (
+                exchange_name TEXT NOT NULL,
+                queue_name    TEXT NOT NULL,
+                routing_key   TEXT NOT NULL,
+                destination_kind TEXT NOT NULL DEFAULT 'queue',
+                header_args   TEXT,
+                PRIMARY KEY (exchange_name, queue_name, routing_key)
+            );
+            CREATE TABLE IF NOT EXISTS rmq_messages (
+                id                    BIGSERIAL PRIMARY KEY,
+                queue_name            TEXT NOT NULL,
+                routing_key           TEXT NOT NULL,
+                payload               BYTEA NOT NULL,
+                headers               TEXT,
+                properties            TEXT,
+                priority              INTEGER NOT NULL,
+                expires_at            TIMESTAMPTZ,
+                death_count           INTEGER NOT NULL,
+                original_exchange     TEXT,
+                original_routing_key  TEXT,
+                created_at            TIMESTAMPTZ DEFAULT NOW()
+            );
             CREATE INDEX IF NOT EXISTS idx_mq_messages_subject ON mq_messages(subject);
             CREATE INDEX IF NOT EXISTS idx_mq_messages_stream ON mq_messages(stream_name);
             CREATE INDEX IF NOT EXISTS idx_mq_messages_stream_id ON mq_messages(stream_name, id);
-            CREATE INDEX IF NOT EXISTS idx_mq_messages_subject_id ON mq_messages(subject, id);";
+            CREATE INDEX IF NOT EXISTS idx_mq_messages_subject_id ON mq_messages(subject, id);
+            CREATE INDEX IF NOT EXISTS idx_rmq_messages_queue_id ON rmq_messages(queue_name, id);";
 
     private const string MsSqlSchema = @"
             IF OBJECT_ID('mq_messages', 'U') IS NULL
@@ -191,6 +317,58 @@ public class MessageRepository
                 allow_sub      NVARCHAR(MAX) NULL,
                 deny_sub       NVARCHAR(MAX) NULL
             );
+            IF OBJECT_ID('mq_rabbit_permissions', 'U') IS NULL
+            CREATE TABLE mq_rabbit_permissions (
+                username           NVARCHAR(256) PRIMARY KEY,
+                default_vhost      NVARCHAR(256) NULL,
+                allowed_vhosts     NVARCHAR(MAX) NULL,
+                configure_patterns NVARCHAR(MAX) NULL,
+                write_patterns     NVARCHAR(MAX) NULL,
+                read_patterns      NVARCHAR(MAX) NULL
+            );
+            IF OBJECT_ID('rmq_exchanges', 'U') IS NULL
+            CREATE TABLE rmq_exchanges (
+                name        NVARCHAR(256) PRIMARY KEY,
+                type        NVARCHAR(64) NOT NULL,
+                durable     BIT NOT NULL,
+                auto_delete BIT NOT NULL
+            );
+            IF OBJECT_ID('rmq_queues', 'U') IS NULL
+            CREATE TABLE rmq_queues (
+                name                    NVARCHAR(256) PRIMARY KEY,
+                durable                 BIT NOT NULL,
+                exclusive               BIT NOT NULL,
+                auto_delete             BIT NOT NULL,
+                max_priority            TINYINT NOT NULL,
+                dead_letter_exchange    NVARCHAR(256) NULL,
+                dead_letter_routing_key NVARCHAR(256) NULL,
+                message_ttl_ms          INT NULL,
+                queue_ttl_ms            INT NULL
+            );
+            IF OBJECT_ID('rmq_bindings', 'U') IS NULL
+            CREATE TABLE rmq_bindings (
+                exchange_name NVARCHAR(256) NOT NULL,
+                queue_name    NVARCHAR(256) NOT NULL,
+                routing_key   NVARCHAR(512) NOT NULL,
+                destination_kind NVARCHAR(32) NOT NULL DEFAULT 'queue',
+                header_args   NVARCHAR(MAX) NULL,
+                CONSTRAINT PK_rmq_bindings PRIMARY KEY (exchange_name, queue_name, routing_key)
+            );
+            IF OBJECT_ID('rmq_messages', 'U') IS NULL
+            CREATE TABLE rmq_messages (
+                id                    BIGINT IDENTITY(1,1) PRIMARY KEY,
+                queue_name            NVARCHAR(256) NOT NULL,
+                routing_key           NVARCHAR(512) NOT NULL,
+                payload               VARBINARY(MAX) NOT NULL,
+                headers               NVARCHAR(MAX) NULL,
+                properties            NVARCHAR(MAX) NULL,
+                priority              TINYINT NOT NULL,
+                expires_at            DATETIME2 NULL,
+                death_count           INT NOT NULL,
+                original_exchange     NVARCHAR(256) NULL,
+                original_routing_key  NVARCHAR(512) NULL,
+                created_at            DATETIME2 DEFAULT SYSUTCDATETIME()
+            );
             IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'idx_mq_messages_subject' AND object_id = OBJECT_ID('mq_messages'))
             CREATE INDEX idx_mq_messages_subject ON mq_messages(subject);
             IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'idx_mq_messages_stream' AND object_id = OBJECT_ID('mq_messages'))
@@ -198,7 +376,9 @@ public class MessageRepository
             IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'idx_mq_messages_stream_id' AND object_id = OBJECT_ID('mq_messages'))
             CREATE INDEX idx_mq_messages_stream_id ON mq_messages(stream_name, id);
             IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'idx_mq_messages_subject_id' AND object_id = OBJECT_ID('mq_messages'))
-            CREATE INDEX idx_mq_messages_subject_id ON mq_messages(subject, id);";
+            CREATE INDEX idx_mq_messages_subject_id ON mq_messages(subject, id);
+            IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'idx_rmq_messages_queue_id' AND object_id = OBJECT_ID('rmq_messages'))
+            CREATE INDEX idx_rmq_messages_queue_id ON rmq_messages(queue_name, id);";
 
     public async Task AddUserAsync(string username, string password, string? token = null, CancellationToken ct = default)
     {
@@ -261,6 +441,57 @@ public class MessageRepository
             DenyPublish = SplitCsv(row["deny_pub"].AsString()),
             AllowSubscribe = SplitCsv(row["allow_sub"].AsString()),
             DenySubscribe = SplitCsv(row["deny_sub"].AsString())
+        };
+    }
+
+    public async Task SaveRabbitPermissionsAsync(
+        string username,
+        string? defaultVhost,
+        IReadOnlyCollection<string>? allowedVhosts,
+        IReadOnlyCollection<string>? configurePatterns,
+        IReadOnlyCollection<string>? writePatterns,
+        IReadOnlyCollection<string>? readPatterns,
+        CancellationToken ct = default)
+    {
+        var sql = _provider switch
+        {
+            DatabaseProvider.Postgres => "INSERT INTO mq_rabbit_permissions (username, default_vhost, allowed_vhosts, configure_patterns, write_patterns, read_patterns) " +
+                                         "VALUES (@username, @defaultVhost, @allowedVhosts, @configurePatterns, @writePatterns, @readPatterns) " +
+                                         "ON CONFLICT(username) DO UPDATE SET default_vhost = EXCLUDED.default_vhost, allowed_vhosts = EXCLUDED.allowed_vhosts, configure_patterns = EXCLUDED.configure_patterns, write_patterns = EXCLUDED.write_patterns, read_patterns = EXCLUDED.read_patterns",
+            DatabaseProvider.MsSql => "IF EXISTS (SELECT 1 FROM mq_rabbit_permissions WHERE username = @username) " +
+                                      "UPDATE mq_rabbit_permissions SET default_vhost = @defaultVhost, allowed_vhosts = @allowedVhosts, configure_patterns = @configurePatterns, write_patterns = @writePatterns, read_patterns = @readPatterns WHERE username = @username " +
+                                      "ELSE INSERT INTO mq_rabbit_permissions (username, default_vhost, allowed_vhosts, configure_patterns, write_patterns, read_patterns) VALUES (@username, @defaultVhost, @allowedVhosts, @configurePatterns, @writePatterns, @readPatterns)",
+            _ => "INSERT INTO mq_rabbit_permissions (username, default_vhost, allowed_vhosts, configure_patterns, write_patterns, read_patterns) " +
+                 "VALUES (@username, @defaultVhost, @allowedVhosts, @configurePatterns, @writePatterns, @readPatterns) " +
+                 "ON CONFLICT(username) DO UPDATE SET default_vhost = excluded.default_vhost, allowed_vhosts = excluded.allowed_vhosts, configure_patterns = excluded.configure_patterns, write_patterns = excluded.write_patterns, read_patterns = excluded.read_patterns"
+        };
+
+        await _db.ExecuteAsync(sql, new[] {
+            SqlParameter.Named("username", SqlValue.From(username)),
+            SqlParameter.Named("defaultVhost", SqlValue.From(defaultVhost ?? "/")),
+            SqlParameter.Named("allowedVhosts", SqlValue.From(JoinCsv(allowedVhosts))),
+            SqlParameter.Named("configurePatterns", SqlValue.From(JoinCsv(configurePatterns))),
+            SqlParameter.Named("writePatterns", SqlValue.From(JoinCsv(writePatterns))),
+            SqlParameter.Named("readPatterns", SqlValue.From(JoinCsv(readPatterns)))
+        }, ct: ct);
+    }
+
+    public async Task<RabbitPermissions?> GetRabbitPermissionsAsync(string username, CancellationToken ct = default)
+    {
+        var rows = await _db.QueryAsync(
+            "SELECT default_vhost, allowed_vhosts, configure_patterns, write_patterns, read_patterns FROM mq_rabbit_permissions WHERE username = @u",
+            new[] { SqlParameter.Named("u", SqlValue.From(username)) }, ct: ct);
+        if (rows.Count == 0) return null;
+
+        var row = rows[0];
+        return new RabbitPermissions
+        {
+            Username = username,
+            DefaultVhost = NullIfEmpty(row["default_vhost"].AsString()) ?? "/",
+            AllowedVhosts = SplitCsv(row["allowed_vhosts"].AsString()),
+            ConfigurePatterns = SplitCsv(row["configure_patterns"].AsString()),
+            WritePatterns = SplitCsv(row["write_patterns"].AsString()),
+            ReadPatterns = SplitCsv(row["read_patterns"].AsString())
         };
     }
 
@@ -407,6 +638,42 @@ public class MessageRepository
         await _db.ExecuteAsync("PRAGMA busy_timeout=5000;", ct: ct);
     }
 
+    private Task EnsureRabbitMessagePropertyColumnAsync(CancellationToken ct)
+    {
+        var sql = _provider switch
+        {
+            DatabaseProvider.Postgres => "ALTER TABLE rmq_messages ADD COLUMN IF NOT EXISTS properties TEXT",
+            DatabaseProvider.MsSql => "IF COL_LENGTH('rmq_messages', 'properties') IS NULL ALTER TABLE rmq_messages ADD properties NVARCHAR(MAX) NULL",
+            _ => "ALTER TABLE rmq_messages ADD COLUMN properties TEXT"
+        };
+
+        return ExecuteIgnoreDuplicateColumnAsync(sql, ct);
+    }
+
+    private Task EnsureRabbitBindingDestinationKindColumnAsync(CancellationToken ct)
+    {
+        var sql = _provider switch
+        {
+            DatabaseProvider.Postgres => "ALTER TABLE rmq_bindings ADD COLUMN IF NOT EXISTS destination_kind TEXT NOT NULL DEFAULT 'queue'",
+            DatabaseProvider.MsSql => "IF COL_LENGTH('rmq_bindings', 'destination_kind') IS NULL ALTER TABLE rmq_bindings ADD destination_kind NVARCHAR(32) NOT NULL CONSTRAINT DF_rmq_bindings_destination_kind DEFAULT 'queue'",
+            _ => "ALTER TABLE rmq_bindings ADD COLUMN destination_kind TEXT NOT NULL DEFAULT 'queue'"
+        };
+
+        return ExecuteIgnoreDuplicateColumnAsync(sql, ct);
+    }
+
+    private async Task ExecuteIgnoreDuplicateColumnAsync(string sql, CancellationToken ct)
+    {
+        try
+        {
+            await _db.ExecuteAsync(sql, ct: ct);
+        }
+        catch (Exception ex) when (_provider == DatabaseProvider.Sqlite &&
+                                   ex.Message.Contains("duplicate column name", StringComparison.OrdinalIgnoreCase))
+        {
+        }
+    }
+
     private async Task JetStreamWriteLoopAsync()
     {
         if (_jsWriteChannel == null) return;
@@ -469,14 +736,158 @@ public class MessageRepository
         }
     }
 
+    private async Task RabbitWriteLoopAsync()
+    {
+        if (_rmqWriteChannel == null) return;
+        var reader = _rmqWriteChannel.Reader;
+        var batch = new List<RabbitWrite>(_rmqBatchSize);
+
+        while (await reader.WaitToReadAsync())
+        {
+            if (!reader.TryRead(out var first)) continue;
+            batch.Add(first);
+
+            var delayTask = Task.Delay(_rmqBatchMaxDelay);
+            while (batch.Count < _rmqBatchSize)
+            {
+                while (reader.TryRead(out var item))
+                {
+                    batch.Add(item);
+                    if (batch.Count >= _rmqBatchSize) break;
+                }
+                if (batch.Count >= _rmqBatchSize) break;
+
+                var waitTask = reader.WaitToReadAsync().AsTask();
+                var completed = await Task.WhenAny(waitTask, delayTask);
+                if (completed == delayTask) break;
+                if (!waitTask.Result) break;
+            }
+
+            await PersistRabbitBatchAsync(batch);
+            batch.Clear();
+        }
+    }
+
+    private async Task PersistRabbitBatchAsync(List<RabbitWrite> batch)
+    {
+        if (batch.Count == 0) return;
+        await _sqliteRabbitWriteLock.WaitAsync();
+        try
+        {
+            await _db.ExecuteAsync("BEGIN IMMEDIATE;");
+            var completions = new List<(TaskCompletionSource<long> Tcs, long Id)>(batch.Count);
+            foreach (var item in batch)
+            {
+                var rows = await _db.QueryAsync(
+                    "INSERT INTO rmq_messages (queue_name, routing_key, payload, headers, properties, priority, expires_at, death_count, original_exchange, original_routing_key) VALUES (@queue, @routing, @payload, @headers, @properties, @priority, @expires, @death, @exchange, @originalRouting); SELECT last_insert_rowid() as id;",
+                    new[]
+                    {
+                        SqlParameter.Named("queue", SqlValue.From(item.ScopedQueue)),
+                        SqlParameter.Named("routing", SqlValue.From(item.Message.RoutingKey)),
+                        SqlParameter.Named("payload", SqlValue.From(item.Message.Payload)),
+                        SqlParameter.Named("headers", SqlValue.From(item.Headers ?? string.Empty)),
+                        SqlParameter.Named("properties", SqlValue.From(item.Properties ?? string.Empty)),
+                        SqlParameter.Named("priority", SqlValue.From((int)item.Message.Priority)),
+                        SqlParameter.Named("expires", SqlValue.From(item.ExpiresAt ?? string.Empty)),
+                        SqlParameter.Named("death", SqlValue.From(item.Message.DeathCount)),
+                        SqlParameter.Named("exchange", SqlValue.From(item.Message.OriginalExchange ?? string.Empty)),
+                        SqlParameter.Named("originalRouting", SqlValue.From(item.Message.OriginalRoutingKey ?? string.Empty))
+                    });
+                completions.Add((item.Tcs, rows[0]["id"].AsInt() ?? 0));
+            }
+            await _db.ExecuteAsync("COMMIT;");
+            foreach (var (tcs, id) in completions)
+                tcs.TrySetResult(id);
+        }
+        catch (Exception ex)
+        {
+            try { await _db.ExecuteAsync("ROLLBACK;"); } catch { }
+            foreach (var item in batch)
+                item.Tcs.TrySetException(ex);
+        }
+        finally
+        {
+            _sqliteRabbitWriteLock.Release();
+        }
+    }
+
+    private async Task RabbitDeleteLoopAsync()
+    {
+        if (_rmqDeleteChannel == null) return;
+        var reader = _rmqDeleteChannel.Reader;
+        var batch = new List<RabbitDelete>(_rmqBatchSize);
+
+        while (await reader.WaitToReadAsync())
+        {
+            if (!reader.TryRead(out var first)) continue;
+            batch.Add(first);
+
+            var delayTask = Task.Delay(_rmqBatchMaxDelay);
+            while (batch.Count < _rmqBatchSize)
+            {
+                while (reader.TryRead(out var item))
+                {
+                    batch.Add(item);
+                    if (batch.Count >= _rmqBatchSize) break;
+                }
+                if (batch.Count >= _rmqBatchSize) break;
+
+                var waitTask = reader.WaitToReadAsync().AsTask();
+                var completed = await Task.WhenAny(waitTask, delayTask);
+                if (completed == delayTask) break;
+                if (!waitTask.Result) break;
+            }
+
+            await PersistRabbitDeleteBatchAsync(batch);
+            batch.Clear();
+        }
+    }
+
+    private async Task PersistRabbitDeleteBatchAsync(List<RabbitDelete> batch)
+    {
+        if (batch.Count == 0) return;
+        await _sqliteRabbitWriteLock.WaitAsync();
+        try
+        {
+            await _db.ExecuteAsync("BEGIN IMMEDIATE;");
+            foreach (var item in batch)
+            {
+                await _db.ExecuteAsync(
+                    "DELETE FROM rmq_messages WHERE id = @id",
+                    new[] { SqlParameter.Named("id", SqlValue.From(item.Id)) });
+            }
+            await _db.ExecuteAsync("COMMIT;");
+        }
+        catch (Exception ex)
+        {
+            try { await _db.ExecuteAsync("ROLLBACK;"); } catch { }
+            Console.Error.WriteLine($"[Persist] Rabbit delete batch failed: {ex.Message}");
+        }
+        finally
+        {
+            _sqliteRabbitWriteLock.Release();
+        }
+    }
+
     public async Task FlushAsync(CancellationToken ct = default)
     {
         if (_jsWriteChannel == null || _jsWriteLoop == null) return;
         _jsWriteChannel.Writer.TryComplete();
-        using var reg = ct.Register(() => _jsWriteChannel.Writer.TryComplete());
+        _rmqWriteChannel?.Writer.TryComplete();
+        _rmqDeleteChannel?.Writer.TryComplete();
+        using var reg = ct.Register(() =>
+        {
+            _jsWriteChannel.Writer.TryComplete();
+            _rmqWriteChannel?.Writer.TryComplete();
+            _rmqDeleteChannel?.Writer.TryComplete();
+        });
         try
         {
             await _jsWriteLoop;
+            if (_rmqWriteLoop != null)
+                await _rmqWriteLoop;
+            if (_rmqDeleteLoop != null)
+                await _rmqDeleteLoop;
         }
         catch { }
     }
@@ -497,6 +908,20 @@ public class MessageRepository
         return TimeSpan.FromMilliseconds(2);
     }
 
+    private static int ResolveRabbitBatchSize()
+    {
+        if (int.TryParse(Environment.GetEnvironmentVariable("COSMOBROKER_RMQ_BATCH_SIZE"), out var env) && env > 0)
+            return env;
+        return 128;
+    }
+
+    private static TimeSpan ResolveRabbitBatchDelay()
+    {
+        if (int.TryParse(Environment.GetEnvironmentVariable("COSMOBROKER_RMQ_BATCH_DELAY_MS"), out var env) && env >= 0)
+            return TimeSpan.FromMilliseconds(env);
+        return TimeSpan.Zero;
+    }
+
     public async Task<List<PersistedMessage>> GetJetStreamMessagesAsync(string streamName, long startAfterId, int limit = 100, CancellationToken ct = default)
     {
         var query = _provider == DatabaseProvider.MsSql
@@ -515,6 +940,296 @@ public class MessageRepository
         }).ToList();
     }
 
+    public Task SaveRabbitExchangeAsync(string name, string type, bool durable, bool autoDelete, CancellationToken ct = default)
+        => SaveRabbitExchangeAsync("/", name, type, durable, autoDelete, ct);
+
+    public async Task SaveRabbitExchangeAsync(string vhost, string name, string type, bool durable, bool autoDelete, CancellationToken ct = default)
+    {
+        string scopedName = EncodeRabbitScopedName(vhost, name);
+        var sql = _provider switch
+        {
+            DatabaseProvider.Postgres => "INSERT INTO rmq_exchanges (name, type, durable, auto_delete) VALUES (@name, @type, @durable, @autoDelete) " +
+                                         "ON CONFLICT(name) DO UPDATE SET type = EXCLUDED.type, durable = EXCLUDED.durable, auto_delete = EXCLUDED.auto_delete",
+            DatabaseProvider.MsSql => "IF EXISTS (SELECT 1 FROM rmq_exchanges WHERE name = @name) " +
+                                      "UPDATE rmq_exchanges SET type = @type, durable = @durable, auto_delete = @autoDelete WHERE name = @name " +
+                                      "ELSE INSERT INTO rmq_exchanges (name, type, durable, auto_delete) VALUES (@name, @type, @durable, @autoDelete)",
+            _ => "INSERT INTO rmq_exchanges (name, type, durable, auto_delete) VALUES (@name, @type, @durable, @autoDelete) " +
+                 "ON CONFLICT(name) DO UPDATE SET type = excluded.type, durable = excluded.durable, auto_delete = excluded.auto_delete"
+        };
+
+        await _db.ExecuteAsync(sql, new[] {
+            SqlParameter.Named("name", SqlValue.From(scopedName)),
+            SqlParameter.Named("type", SqlValue.From(type)),
+            SqlParameter.Named("durable", SqlValue.From(durable)),
+            SqlParameter.Named("autoDelete", SqlValue.From(autoDelete))
+        }, ct: ct);
+    }
+
+    public Task DeleteRabbitExchangeAsync(string name, CancellationToken ct = default)
+        => DeleteRabbitExchangeAsync("/", name, ct);
+
+    public async Task DeleteRabbitExchangeAsync(string vhost, string name, CancellationToken ct = default)
+    {
+        string scopedName = EncodeRabbitScopedName(vhost, name);
+        await _db.ExecuteAsync("DELETE FROM rmq_bindings WHERE exchange_name = @name",
+            new[] { SqlParameter.Named("name", SqlValue.From(scopedName)) }, ct: ct);
+        await _db.ExecuteAsync("DELETE FROM rmq_exchanges WHERE name = @name",
+            new[] { SqlParameter.Named("name", SqlValue.From(scopedName)) }, ct: ct);
+    }
+
+    public Task SaveRabbitQueueAsync(string name, RabbitQueueArgs args, CancellationToken ct = default)
+        => SaveRabbitQueueAsync("/", name, args, ct);
+
+    public async Task SaveRabbitQueueAsync(string vhost, string name, RabbitQueueArgs args, CancellationToken ct = default)
+    {
+        string scopedName = EncodeRabbitScopedName(vhost, name);
+        var sql = _provider switch
+        {
+            DatabaseProvider.Postgres => "INSERT INTO rmq_queues (name, durable, exclusive, auto_delete, max_priority, dead_letter_exchange, dead_letter_routing_key, message_ttl_ms, queue_ttl_ms) " +
+                                         "VALUES (@name, @durable, @exclusive, @autoDelete, @maxPriority, @dlx, @dlrk, @msgTtl, @queueTtl) " +
+                                         "ON CONFLICT(name) DO UPDATE SET durable = EXCLUDED.durable, exclusive = EXCLUDED.exclusive, auto_delete = EXCLUDED.auto_delete, max_priority = EXCLUDED.max_priority, dead_letter_exchange = EXCLUDED.dead_letter_exchange, dead_letter_routing_key = EXCLUDED.dead_letter_routing_key, message_ttl_ms = EXCLUDED.message_ttl_ms, queue_ttl_ms = EXCLUDED.queue_ttl_ms",
+            DatabaseProvider.MsSql => "IF EXISTS (SELECT 1 FROM rmq_queues WHERE name = @name) " +
+                                      "UPDATE rmq_queues SET durable = @durable, exclusive = @exclusive, auto_delete = @autoDelete, max_priority = @maxPriority, dead_letter_exchange = @dlx, dead_letter_routing_key = @dlrk, message_ttl_ms = @msgTtl, queue_ttl_ms = @queueTtl WHERE name = @name " +
+                                      "ELSE INSERT INTO rmq_queues (name, durable, exclusive, auto_delete, max_priority, dead_letter_exchange, dead_letter_routing_key, message_ttl_ms, queue_ttl_ms) VALUES (@name, @durable, @exclusive, @autoDelete, @maxPriority, @dlx, @dlrk, @msgTtl, @queueTtl)",
+            _ => "INSERT INTO rmq_queues (name, durable, exclusive, auto_delete, max_priority, dead_letter_exchange, dead_letter_routing_key, message_ttl_ms, queue_ttl_ms) " +
+                 "VALUES (@name, @durable, @exclusive, @autoDelete, @maxPriority, @dlx, @dlrk, @msgTtl, @queueTtl) " +
+                 "ON CONFLICT(name) DO UPDATE SET durable = excluded.durable, exclusive = excluded.exclusive, auto_delete = excluded.auto_delete, max_priority = excluded.max_priority, dead_letter_exchange = excluded.dead_letter_exchange, dead_letter_routing_key = excluded.dead_letter_routing_key, message_ttl_ms = excluded.message_ttl_ms, queue_ttl_ms = excluded.queue_ttl_ms"
+        };
+
+        await _db.ExecuteAsync(sql, new[] {
+            SqlParameter.Named("name", SqlValue.From(scopedName)),
+            SqlParameter.Named("durable", SqlValue.From(args.Durable)),
+            SqlParameter.Named("exclusive", SqlValue.From(args.Exclusive)),
+            SqlParameter.Named("autoDelete", SqlValue.From(args.AutoDelete)),
+            SqlParameter.Named("maxPriority", SqlValue.From((int)args.MaxPriority)),
+            SqlParameter.Named("dlx", SqlValue.From(args.DeadLetterExchange ?? string.Empty)),
+            SqlParameter.Named("dlrk", SqlValue.From(args.DeadLetterRoutingKey ?? string.Empty)),
+            SqlParameter.Named("msgTtl", SqlValue.From(args.MessageTtlMs.HasValue ? args.MessageTtlMs.Value : 0)),
+            SqlParameter.Named("queueTtl", SqlValue.From(args.QueueTtlMs.HasValue ? args.QueueTtlMs.Value : 0))
+        }, ct: ct);
+    }
+
+    public Task DeleteRabbitQueueAsync(string name, CancellationToken ct = default)
+        => DeleteRabbitQueueAsync("/", name, ct);
+
+    public async Task DeleteRabbitQueueAsync(string vhost, string name, CancellationToken ct = default)
+    {
+        string scopedName = EncodeRabbitScopedName(vhost, name);
+        await _db.ExecuteAsync("DELETE FROM rmq_messages WHERE queue_name = @name",
+            new[] { SqlParameter.Named("name", SqlValue.From(scopedName)) }, ct: ct);
+        await _db.ExecuteAsync("DELETE FROM rmq_bindings WHERE queue_name = @name",
+            new[] { SqlParameter.Named("name", SqlValue.From(scopedName)) }, ct: ct);
+        await _db.ExecuteAsync("DELETE FROM rmq_queues WHERE name = @name",
+            new[] { SqlParameter.Named("name", SqlValue.From(scopedName)) }, ct: ct);
+    }
+
+    public Task SaveRabbitBindingAsync(string exchangeName, string queueName, string routingKey, Dictionary<string, string>? headerArgs, CancellationToken ct = default)
+        => SaveRabbitBindingAsync("/", exchangeName, queueName, routingKey, headerArgs, BindingDestinationKind.Queue, ct);
+
+    public async Task SaveRabbitBindingAsync(string vhost, string exchangeName, string queueName, string routingKey, Dictionary<string, string>? headerArgs, BindingDestinationKind destinationKind = BindingDestinationKind.Queue, CancellationToken ct = default)
+    {
+        string headerJson = headerArgs == null ? string.Empty : JsonSerializer.Serialize(headerArgs);
+        string scopedExchange = EncodeRabbitScopedName(vhost, exchangeName);
+        string scopedQueue = EncodeRabbitScopedName(vhost, queueName);
+        var sql = _provider switch
+        {
+            DatabaseProvider.Postgres => "INSERT INTO rmq_bindings (exchange_name, queue_name, routing_key, destination_kind, header_args) VALUES (@exchange, @queue, @routing, @kind, @headers) " +
+                                         "ON CONFLICT(exchange_name, queue_name, routing_key) DO UPDATE SET destination_kind = EXCLUDED.destination_kind, header_args = EXCLUDED.header_args",
+            DatabaseProvider.MsSql => "IF EXISTS (SELECT 1 FROM rmq_bindings WHERE exchange_name = @exchange AND queue_name = @queue AND routing_key = @routing) " +
+                                      "UPDATE rmq_bindings SET destination_kind = @kind, header_args = @headers WHERE exchange_name = @exchange AND queue_name = @queue AND routing_key = @routing " +
+                                      "ELSE INSERT INTO rmq_bindings (exchange_name, queue_name, routing_key, destination_kind, header_args) VALUES (@exchange, @queue, @routing, @kind, @headers)",
+            _ => "INSERT INTO rmq_bindings (exchange_name, queue_name, routing_key, destination_kind, header_args) VALUES (@exchange, @queue, @routing, @kind, @headers) " +
+                 "ON CONFLICT(exchange_name, queue_name, routing_key) DO UPDATE SET destination_kind = excluded.destination_kind, header_args = excluded.header_args"
+        };
+
+        await _db.ExecuteAsync(sql, new[] {
+            SqlParameter.Named("exchange", SqlValue.From(scopedExchange)),
+            SqlParameter.Named("queue", SqlValue.From(scopedQueue)),
+            SqlParameter.Named("routing", SqlValue.From(routingKey)),
+            SqlParameter.Named("kind", SqlValue.From(destinationKind.ToString().ToLowerInvariant())),
+            SqlParameter.Named("headers", SqlValue.From(headerJson))
+        }, ct: ct);
+    }
+
+    public Task DeleteRabbitBindingAsync(string exchangeName, string queueName, string routingKey, CancellationToken ct = default)
+        => DeleteRabbitBindingAsync("/", exchangeName, queueName, routingKey, BindingDestinationKind.Queue, ct);
+
+    public async Task DeleteRabbitBindingAsync(string vhost, string exchangeName, string queueName, string routingKey, BindingDestinationKind destinationKind = BindingDestinationKind.Queue, CancellationToken ct = default)
+    {
+        string scopedExchange = EncodeRabbitScopedName(vhost, exchangeName);
+        string scopedQueue = EncodeRabbitScopedName(vhost, queueName);
+        await _db.ExecuteAsync(
+            "DELETE FROM rmq_bindings WHERE exchange_name = @exchange AND queue_name = @queue AND routing_key = @routing AND destination_kind = @kind",
+            new[] {
+                SqlParameter.Named("exchange", SqlValue.From(scopedExchange)),
+                SqlParameter.Named("queue", SqlValue.From(scopedQueue)),
+                SqlParameter.Named("routing", SqlValue.From(routingKey)),
+                SqlParameter.Named("kind", SqlValue.From(destinationKind.ToString().ToLowerInvariant()))
+            }, ct: ct);
+    }
+
+    public async Task DeleteRabbitBindingsForDestinationAsync(string vhost, string exchangeName, string destinationName, BindingDestinationKind destinationKind = BindingDestinationKind.Queue, CancellationToken ct = default)
+    {
+        string scopedExchange = EncodeRabbitScopedName(vhost, exchangeName);
+        string scopedDestination = EncodeRabbitScopedName(vhost, destinationName);
+        await _db.ExecuteAsync(
+            "DELETE FROM rmq_bindings WHERE exchange_name = @exchange AND queue_name = @destination AND destination_kind = @kind",
+            new[] {
+                SqlParameter.Named("exchange", SqlValue.From(scopedExchange)),
+                SqlParameter.Named("destination", SqlValue.From(scopedDestination)),
+                SqlParameter.Named("kind", SqlValue.From(destinationKind.ToString().ToLowerInvariant()))
+            }, ct: ct);
+    }
+
+    public Task<long> EnqueueRabbitMessageAsync(string queueName, RabbitMessage message, bool immediate = false, CancellationToken ct = default)
+        => EnqueueRabbitMessageAsync("/", queueName, message, immediate, ct);
+
+    public async Task<long> EnqueueRabbitMessageAsync(string vhost, string queueName, RabbitMessage message, bool immediate = false, CancellationToken ct = default)
+    {
+        string? headers = message.Headers == null ? null : JsonSerializer.Serialize(message.Headers);
+        string? properties = JsonSerializer.Serialize(message.Properties);
+        string? expiresAt = message.ExpiresAt?.ToString("O");
+        string scopedQueue = EncodeRabbitScopedName(vhost, queueName);
+
+        if (_provider == DatabaseProvider.Sqlite && immediate)
+        {
+            await _sqliteRabbitWriteLock.WaitAsync(ct);
+            try
+            {
+                var immediateRows = await _db.QueryAsync(
+                    "INSERT INTO rmq_messages (queue_name, routing_key, payload, headers, properties, priority, expires_at, death_count, original_exchange, original_routing_key) VALUES (@queue, @routing, @payload, @headers, @properties, @priority, @expires, @death, @exchange, @originalRouting); SELECT last_insert_rowid() as id;",
+                    new[] {
+                        SqlParameter.Named("queue", SqlValue.From(scopedQueue)),
+                        SqlParameter.Named("routing", SqlValue.From(message.RoutingKey)),
+                        SqlParameter.Named("payload", SqlValue.From(message.Payload)),
+                        SqlParameter.Named("headers", SqlValue.From(headers ?? string.Empty)),
+                        SqlParameter.Named("properties", SqlValue.From(properties ?? string.Empty)),
+                        SqlParameter.Named("priority", SqlValue.From((int)message.Priority)),
+                        SqlParameter.Named("expires", SqlValue.From(expiresAt ?? string.Empty)),
+                        SqlParameter.Named("death", SqlValue.From(message.DeathCount)),
+                        SqlParameter.Named("exchange", SqlValue.From(message.OriginalExchange ?? string.Empty)),
+                        SqlParameter.Named("originalRouting", SqlValue.From(message.OriginalRoutingKey ?? string.Empty))
+                    }, ct: ct);
+                return immediateRows[0]["id"].AsInt() ?? 0;
+            }
+            finally
+            {
+                _sqliteRabbitWriteLock.Release();
+            }
+        }
+
+        if (_provider == DatabaseProvider.Sqlite && _rmqWriteChannel != null)
+        {
+            var tcs = new TaskCompletionSource<long>(TaskCreationOptions.RunContinuationsAsynchronously);
+            await _rmqWriteChannel.Writer.WriteAsync(
+                new RabbitWrite(scopedQueue, message, headers, properties, expiresAt, tcs),
+                ct);
+            return await tcs.Task.WaitAsync(ct);
+        }
+
+        var sql = _provider switch
+        {
+            DatabaseProvider.Postgres => "INSERT INTO rmq_messages (queue_name, routing_key, payload, headers, properties, priority, expires_at, death_count, original_exchange, original_routing_key) VALUES (@queue, @routing, @payload, @headers, @properties, @priority, @expires, @death, @exchange, @originalRouting) RETURNING id",
+            DatabaseProvider.MsSql => "INSERT INTO rmq_messages (queue_name, routing_key, payload, headers, properties, priority, expires_at, death_count, original_exchange, original_routing_key) VALUES (@queue, @routing, @payload, @headers, @properties, @priority, @expires, @death, @exchange, @originalRouting); SELECT CAST(SCOPE_IDENTITY() AS BIGINT) as id;",
+            _ => "INSERT INTO rmq_messages (queue_name, routing_key, payload, headers, properties, priority, expires_at, death_count, original_exchange, original_routing_key) VALUES (@queue, @routing, @payload, @headers, @properties, @priority, @expires, @death, @exchange, @originalRouting); SELECT last_insert_rowid() as id;"
+        };
+
+        var rows = await _db.QueryAsync(sql, new[] {
+            SqlParameter.Named("queue", SqlValue.From(scopedQueue)),
+            SqlParameter.Named("routing", SqlValue.From(message.RoutingKey)),
+            SqlParameter.Named("payload", SqlValue.From(message.Payload)),
+            SqlParameter.Named("headers", SqlValue.From(headers ?? string.Empty)),
+            SqlParameter.Named("properties", SqlValue.From(properties ?? string.Empty)),
+            SqlParameter.Named("priority", SqlValue.From((int)message.Priority)),
+            SqlParameter.Named("expires", SqlValue.From(expiresAt ?? string.Empty)),
+            SqlParameter.Named("death", SqlValue.From(message.DeathCount)),
+            SqlParameter.Named("exchange", SqlValue.From(message.OriginalExchange ?? string.Empty)),
+            SqlParameter.Named("originalRouting", SqlValue.From(message.OriginalRoutingKey ?? string.Empty))
+        }, ct: ct);
+
+        return rows[0]["id"].AsInt() ?? 0;
+    }
+
+    public async Task DeleteRabbitMessageAsync(long id, CancellationToken ct = default)
+    {
+        if (_provider == DatabaseProvider.Sqlite && _rmqDeleteChannel != null)
+        {
+            if (!_rmqDeleteChannel.Writer.TryWrite(new RabbitDelete(id)))
+                await _rmqDeleteChannel.Writer.WriteAsync(new RabbitDelete(id), ct);
+            return;
+        }
+
+        await _db.ExecuteAsync("DELETE FROM rmq_messages WHERE id = @id",
+            new[] { SqlParameter.Named("id", SqlValue.From(id)) }, ct: ct);
+    }
+
+    public async Task<List<PersistedRabbitExchange>> GetRabbitExchangesAsync(CancellationToken ct = default)
+    {
+        var rows = await _db.QueryAsync("SELECT name, type, durable, auto_delete FROM rmq_exchanges ORDER BY name", ct: ct);
+        return rows.Select(row => new PersistedRabbitExchange
+        {
+            Vhost = DecodeRabbitScopedName(row["name"].AsString()).Vhost,
+            Name = DecodeRabbitScopedName(row["name"].AsString()).Name,
+            Type = row["type"].AsString() ?? string.Empty,
+            Durable = AsBool(row["durable"]),
+            AutoDelete = AsBool(row["auto_delete"])
+        }).ToList();
+    }
+
+    public async Task<List<PersistedRabbitQueue>> GetRabbitQueuesAsync(CancellationToken ct = default)
+    {
+        var rows = await _db.QueryAsync("SELECT name, durable, exclusive, auto_delete, max_priority, dead_letter_exchange, dead_letter_routing_key, message_ttl_ms, queue_ttl_ms FROM rmq_queues ORDER BY name", ct: ct);
+        return rows.Select(row => new PersistedRabbitQueue
+        {
+            Vhost = DecodeRabbitScopedName(row["name"].AsString()).Vhost,
+            Name = DecodeRabbitScopedName(row["name"].AsString()).Name,
+            Durable = AsBool(row["durable"]),
+            Exclusive = AsBool(row["exclusive"]),
+            AutoDelete = AsBool(row["auto_delete"]),
+            MaxPriority = (byte)(row["max_priority"].AsInt() ?? 0),
+            DeadLetterExchange = NullIfEmpty(row["dead_letter_exchange"].AsString()),
+            DeadLetterRoutingKey = NullIfEmpty(row["dead_letter_routing_key"].AsString()),
+            MessageTtlMs = NullIfZero(row["message_ttl_ms"].AsInt()),
+            QueueTtlMs = NullIfZero(row["queue_ttl_ms"].AsInt())
+        }).ToList();
+    }
+
+    public async Task<List<PersistedRabbitBinding>> GetRabbitBindingsAsync(CancellationToken ct = default)
+    {
+        var rows = await _db.QueryAsync("SELECT exchange_name, queue_name, routing_key, destination_kind, header_args FROM rmq_bindings ORDER BY exchange_name, queue_name, routing_key", ct: ct);
+        return rows.Select(row => new PersistedRabbitBinding
+        {
+            Vhost = DecodeRabbitScopedName(row["exchange_name"].AsString()).Vhost,
+            ExchangeName = DecodeRabbitScopedName(row["exchange_name"].AsString()).Name,
+            DestinationName = DecodeRabbitScopedName(row["queue_name"].AsString()).Name,
+            RoutingKey = row["routing_key"].AsString() ?? string.Empty,
+            DestinationKind = Enum.TryParse<BindingDestinationKind>(row["destination_kind"].AsString(), true, out var destinationKind)
+                ? destinationKind
+                : BindingDestinationKind.Queue,
+            HeaderArgs = DeserializeHeaders(row["header_args"].AsString())
+        }).ToList();
+    }
+
+    public async Task<List<PersistedRabbitMessage>> GetRabbitMessagesAsync(CancellationToken ct = default)
+    {
+        var rows = await _db.QueryAsync("SELECT id, queue_name, routing_key, payload, headers, properties, priority, expires_at, death_count, original_exchange, original_routing_key FROM rmq_messages ORDER BY queue_name, id", ct: ct);
+        return rows.Select(row => new PersistedRabbitMessage
+        {
+            Id = row["id"].AsInt() ?? 0,
+            Vhost = DecodeRabbitScopedName(row["queue_name"].AsString()).Vhost,
+            QueueName = DecodeRabbitScopedName(row["queue_name"].AsString()).Name,
+            RoutingKey = row["routing_key"].AsString() ?? string.Empty,
+            Payload = row["payload"].AsBytes() ?? Array.Empty<byte>(),
+            Headers = DeserializeHeaders(row["headers"].AsString()),
+            Properties = DeserializeRabbitProperties(row["properties"].AsString()),
+            Priority = (byte)(row["priority"].AsInt() ?? 0),
+            ExpiresAt = ParseDate(row["expires_at"].AsString()),
+            DeathCount = (int)(row["death_count"].AsInt() ?? 0),
+            OriginalExchange = NullIfEmpty(row["original_exchange"].AsString()),
+            OriginalRoutingKey = NullIfEmpty(row["original_routing_key"].AsString())
+        }).ToList();
+    }
+
     private static List<string> SplitCsv(string? csv)
     {
         if (string.IsNullOrWhiteSpace(csv)) return new List<string>();
@@ -522,6 +1237,12 @@ public class MessageRepository
             .Select(s => s.Trim())
             .Where(s => s.Length > 0)
             .ToList();
+    }
+
+    private static string JoinCsv(IReadOnlyCollection<string>? values)
+    {
+        if (values == null || values.Count == 0) return string.Empty;
+        return string.Join(",", values.Where(v => !string.IsNullOrWhiteSpace(v)).Select(v => v.Trim()));
     }
 
     private static (DatabaseProvider Provider, string ConnectionString) ResolveProvider(string connectionString, DatabaseProvider? provider)
@@ -554,6 +1275,65 @@ public class MessageRepository
 
         return (DatabaseProvider.Sqlite, cs);
     }
+
+    private static bool AsBool(dynamic value)
+    {
+        return (value.AsInt() ?? 0) != 0 || string.Equals(value.AsString(), "true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int? NullIfZero(long? value) => value is null or 0 ? null : (int)value.Value;
+
+    private static string? NullIfEmpty(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
+
+    private static Dictionary<string, string>? DeserializeHeaders(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return null;
+        try
+        {
+            return JsonSerializer.Deserialize<Dictionary<string, string>>(json);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static RabbitMessageProperties DeserializeRabbitProperties(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return new RabbitMessageProperties();
+        try
+        {
+            return JsonSerializer.Deserialize<RabbitMessageProperties>(json) ?? new RabbitMessageProperties();
+        }
+        catch
+        {
+            return new RabbitMessageProperties();
+        }
+    }
+
+    private static DateTime? ParseDate(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        return DateTime.TryParse(value, out var parsed) ? parsed : null;
+    }
+
+    private static string EncodeRabbitScopedName(string? vhost, string name)
+    {
+        var resolvedVhost = string.IsNullOrWhiteSpace(vhost) ? "/" : vhost!.Trim();
+        return $"{resolvedVhost}\u001F{name}";
+    }
+
+    private static (string Vhost, string Name) DecodeRabbitScopedName(string? scopedName)
+    {
+        if (string.IsNullOrEmpty(scopedName))
+            return ("/", string.Empty);
+
+        int separator = scopedName.IndexOf('\u001F');
+        if (separator < 0)
+            return ("/", scopedName);
+
+        return (scopedName[..separator], scopedName[(separator + 1)..]);
+    }
 }
 
 public enum DatabaseProvider
@@ -574,6 +1354,16 @@ public class UserPermissions
     public List<string> DenySubscribe { get; set; } = new();
 }
 
+public class RabbitPermissions
+{
+    public required string Username { get; set; }
+    public string DefaultVhost { get; set; } = "/";
+    public List<string> AllowedVhosts { get; set; } = new();
+    public List<string> ConfigurePatterns { get; set; } = new();
+    public List<string> WritePatterns { get; set; } = new();
+    public List<string> ReadPatterns { get; set; } = new();
+}
+
 public class PersistedStream
 {
     public required string Name { get; set; }
@@ -587,4 +1377,61 @@ public class PersistedMessage
     public required byte[] Payload { get; set; }
 }
 
+public class PersistedRabbitExchange
+{
+    public string Vhost { get; set; } = "/";
+    public required string Name { get; set; }
+    public required string Type { get; set; }
+    public bool Durable { get; set; }
+    public bool AutoDelete { get; set; }
+}
+
+public class PersistedRabbitQueue
+{
+    public string Vhost { get; set; } = "/";
+    public required string Name { get; set; }
+    public bool Durable { get; set; }
+    public bool Exclusive { get; set; }
+    public bool AutoDelete { get; set; }
+    public byte MaxPriority { get; set; }
+    public string? DeadLetterExchange { get; set; }
+    public string? DeadLetterRoutingKey { get; set; }
+    public int? MessageTtlMs { get; set; }
+    public int? QueueTtlMs { get; set; }
+}
+
+public class PersistedRabbitBinding
+{
+    public string Vhost { get; set; } = "/";
+    public required string ExchangeName { get; set; }
+    public required string DestinationName { get; set; }
+    public required string RoutingKey { get; set; }
+    public BindingDestinationKind DestinationKind { get; set; }
+    public Dictionary<string, string>? HeaderArgs { get; set; }
+}
+
+public enum BindingDestinationKind
+{
+    Queue,
+    Exchange
+}
+
+public class PersistedRabbitMessage
+{
+    public long Id { get; set; }
+    public string Vhost { get; set; } = "/";
+    public required string QueueName { get; set; }
+    public required string RoutingKey { get; set; }
+    public required byte[] Payload { get; set; }
+    public Dictionary<string, string>? Headers { get; set; }
+    public RabbitMessageProperties Properties { get; set; } = new();
+    public byte Priority { get; set; }
+    public DateTime? ExpiresAt { get; set; }
+    public int DeathCount { get; set; }
+    public string? OriginalExchange { get; set; }
+    public string? OriginalRoutingKey { get; set; }
+}
+
 internal sealed record JetStreamWrite(string StreamName, string Subject, byte[] Payload, TaskCompletionSource<long> Tcs);
+internal sealed record RabbitWrite(string ScopedQueue, RabbitMessage Message, string? Headers, string? Properties, string? ExpiresAt, TaskCompletionSource<long> Tcs);
+internal sealed record RabbitDelete(long Id);

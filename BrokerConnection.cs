@@ -47,6 +47,7 @@ public class BrokerConnection
     private readonly Auth.IAuthenticator? _authenticator;
     private readonly Services.JetStreamService _jetStream;
     private readonly BrokerServer? _server;
+    private readonly RabbitMQ.RabbitMQService? _rmqService;
     private readonly Pipe _readerPipe;
     private readonly Pipe _sendPipe;
     
@@ -142,7 +143,7 @@ public class BrokerConnection
         public bool Pooled { get; }
     }
 
-    public BrokerConnection(Stream stream, string remoteEndPoint, TopicTree topicTree, Persistence.MessageRepository? repo = null, Auth.IAuthenticator? authenticator = null, Services.JetStreamService? jetStream = null, BrokerServer? server = null, bool sendInfoOnConnect = true)
+    public BrokerConnection(Stream stream, string remoteEndPoint, TopicTree topicTree, Persistence.MessageRepository? repo = null, Auth.IAuthenticator? authenticator = null, Services.JetStreamService? jetStream = null, BrokerServer? server = null, bool sendInfoOnConnect = true, RabbitMQ.RabbitMQService? rmqService = null)
     {
         _stream = stream;
         _remoteEndPoint = remoteEndPoint;
@@ -164,6 +165,7 @@ public class BrokerConnection
             useSynchronizationContext: false
         ));
         _sendInfoOnConnect = sendInfoOnConnect;
+        _rmqService = rmqService;
 
         if (_authenticator == null)
         {
@@ -285,7 +287,8 @@ public class BrokerConnection
             string? replyToStr = replyTo.IsEmpty ? null : GetCachedSubjectString(replyTo);
 
             if (!isHPub && _jetStream.HasStreams == false && (Account == null || string.IsNullOrEmpty(Account.SubjectPrefix))
-                && !(subject.Length >= 4 && subject[0] == '$' && (subject[1] | 0x20) == 'j' && (subject[2] | 0x20) == 's' && subject[3] == '.'))
+                && !(subject.Length >= 4 && subject[0] == '$' && (subject[1] | 0x20) == 'j' && (subject[2] | 0x20) == 's' && subject[3] == '.')
+                && !(subject.Length >= 5 && subject[0] == '$' && (subject[1] | 0x20) == 'r' && (subject[2] | 0x20) == 'm' && (subject[3] | 0x20) == 'q' && subject[4] == '.'))
             {
                 var l1 = MatchCache.Value!;
                 long subVersion = _server!.SublistVersion;
@@ -828,13 +831,17 @@ public class BrokerConnection
         if (!_isAuthenticated) { SendError("Authorization Violation"); return; }
         MsgIn++;
         if (!IsAllowedPublish(subject)) { SendError($"Permissions Violation for Publish to {subject}"); return; }
+        bool isRabbitApi = subject.StartsWith("$RMQ.", StringComparison.OrdinalIgnoreCase);
+        bool isJetStreamApi = subject.StartsWith("$JS.", StringComparison.OrdinalIgnoreCase);
         
         // Fast mapping/scoping
         string scopedSubject = subject;
         if (Account != null)
         {
-            var mappedSubject = (Account.Name != "global") ? Account.Mappings.Map(subject) : subject;
-            if (!string.IsNullOrEmpty(Account.SubjectPrefix))
+            var mappedSubject = (Account.Name != "global" && !isRabbitApi && !isJetStreamApi)
+                ? Account.Mappings.Map(subject)
+                : subject;
+            if (!string.IsNullOrEmpty(Account.SubjectPrefix) && !isRabbitApi && !isJetStreamApi)
             {
                 scopedSubject = Account.SubjectPrefix + "." + mappedSubject;
             }
@@ -850,16 +857,36 @@ public class BrokerConnection
         
         if (!IsRoute && !IsLeaf)
         {
-            if (scopedSubject.StartsWith("$JS.", StringComparison.OrdinalIgnoreCase))
+            // ── $RMQ.* — RabbitMQ API (exchange/queue/pub/consume/ack/nack/qos) ──
+            if (isRabbitApi && _rmqService != null)
             {
-                if (scopedSubject.StartsWith("$JS.API.", StringComparison.OrdinalIgnoreCase))
+                var payloadBytes = payload.ToArray();
+                try
+                {
+                    var response = _rmqService.HandleRequest(
+                        subject, payloadBytes, scopedReplyTo,
+                        (subj, bytes) => _topicTree.Publish(subj, new ReadOnlySequence<byte>(bytes), source: this),
+                        Account,
+                        User,
+                        _nonce);
+                    if (response != null && !string.IsNullOrEmpty(scopedReplyTo))
+                        _topicTree.Publish(scopedReplyTo, new ReadOnlySequence<byte>(response), source: this);
+                }
+                catch (Exception ex) { Console.Error.WriteLine($"[RabbitMQ] API error: {ex.Message}"); }
+                return;
+            }
+
+            // ── $JS.API.* — JetStream API ──
+            if (isJetStreamApi)
+            {
+                if (subject.StartsWith("$JS.API.", StringComparison.OrdinalIgnoreCase))
                 {
                     var payloadBytes = payload.ToArray();
                     var capturedReplyTo = scopedReplyTo;
                     _ = Task.Run(async () => {
                         try
                         {
-                            var response = await _jetStream.HandleApiRequest(scopedSubject, payloadBytes);
+                            var response = await _jetStream.HandleApiRequest(subject, payloadBytes);
                             if (response != null && !string.IsNullOrEmpty(capturedReplyTo))
                                 _topicTree.Publish(capturedReplyTo, new ReadOnlySequence<byte>(response), source: this);
                         }
@@ -867,11 +894,11 @@ public class BrokerConnection
                     });
                     return;
                 }
-                if (scopedSubject.StartsWith("$JS.ACK.", StringComparison.OrdinalIgnoreCase))
+                if (subject.StartsWith("$JS.ACK.", StringComparison.OrdinalIgnoreCase))
                 {
                     // Format: $JS.ACK.<streamName>.<consumerName>.<sequence>
                     // Span-based parse — no Split allocation.
-                    var ackSpan = scopedSubject.AsSpan(8); // skip "$JS.ACK."
+                    var ackSpan = subject.AsSpan(8); // skip "$JS.ACK."
                     int d1 = ackSpan.IndexOf('.');
                     if (d1 != -1)
                     {

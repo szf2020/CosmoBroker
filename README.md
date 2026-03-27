@@ -1,272 +1,330 @@
 # CosmoBroker
 
-**CosmoBroker** is a high-performance, NATS-compatible distributed messaging engine built for .NET 10. It leverages `System.IO.Pipelines` and `Span<T>` to provide a zero-copy, ultra-low-latency messaging backbone that matches the official NATS feature set while adding native SQL-backed persistence and deep .NET ecosystem integration.
+CosmoBroker is a high-performance .NET broker with first-class NATS support and native AMQP 0-9-1 support for RabbitMQ-style workloads. It is designed to be fast on the hot path, durable when backed by SQLite/SQL storage, and practical to operate from code or CLI.
 
----
+## What It Does
 
-## 🏆 Performance: CosmoBroker vs. Official NATS
+- NATS-compatible core messaging on port `4222` by default
+- Native AMQP 0-9-1 listener for standard RabbitMQ clients
+- RabbitMQ-style queues, exchanges, bindings, confirms, transactions, redelivery, and durable message flow
+- JetStream-style persistence and stream features backed by SQLite/SQL
+- MQTT and WebSocket protocol support
+- SQL-backed authentication and account scoping
+- Built-in AMQP comparison and benchmark tooling
 
-CosmoBroker is highly optimized for throughput and latency. In head-to-head benchmarks against the official `nats-server` (using the same client SDK on both sides), CosmoBroker delivers higher throughput and consistently **3× lower latency** at every percentile.
+## Client Libraries
 
-### Benchmark Results (March 26, 2026)
-*Test environment: Apple M-series, 1 publisher, 100,000 messages, 128B payload, nats-server running in Docker.*
+Use the client that matches the protocol you want to speak:
 
-Both clients were run against both servers to give a complete and fair picture.
+- `CosmoBroker.Client` is the native .NET client for CosmoBroker's NATS-compatible surface
+- `RabbitMQ.Client` should be used for AMQP / RabbitMQ-compatible workflows against CosmoBroker's AMQP port
 
-#### CosmoBroker.Client (native SDK) vs both servers
+CosmoBroker does not currently ship a separate custom AMQP client SDK. For AMQP use cases, the intended client is the standard RabbitMQ ecosystem client.
 
-| Server | Throughput | P50 RTT | P95 RTT | P99 RTT |
-| :--- | ---: | ---: | ---: | ---: |
-| **CosmoBroker** | **1,150,483 msg/sec** | **0.059 ms** | **0.103 ms** | **0.138 ms** |
-| nats-server | 853,585 msg/sec | 0.172 ms | 0.267 ms | 0.436 ms |
-| **Advantage** | **+35%** | **2.9×** | **2.6×** | **3.2×** |
+## Protocol Support
 
-#### NATS.Client.Core (official SDK) vs both servers — apples-to-apples
+| Area | Status | Notes |
+|---|---|---|
+| NATS protocol | Supported | Standard pub/sub, request/reply, queue groups |
+| AMQP 0-9-1 | Supported | Native listener for `RabbitMQ.Client` and compatible clients |
+| RabbitMQ-style queues | Supported | Exchanges, queues, bindings, acks, nacks, reject, qos, confirms, tx, get, consume |
+| JetStream-style persistence | Supported | Streams, consumers, mirrors, sources |
+| MQTT 3.1.1 | Supported | Protocol sniffing path |
+| WebSockets | Supported | Browser and proxy-friendly connectivity |
 
-| Server | Throughput | P50 RTT | P95 RTT | P99 RTT |
-| :--- | ---: | ---: | ---: | ---: |
-| **CosmoBroker** | **646,579 msg/sec** | **0.053 ms** | **0.106 ms** | **0.132 ms** |
-| nats-server | 579,567 msg/sec | 0.174 ms | 0.272 ms | 0.405 ms |
-| **Advantage** | **+11.6%** | **3.3×** | **2.6×** | **3.1×** |
+## RabbitMQ Support
 
-**Key takeaways:**
-- **Latency is a server characteristic.** CosmoBroker delivers ~3× lower RTT regardless of which client is used. This is due to inline socket completions, batch-flush coalescing, and the zero-copy dispatch pipeline.
-- **Throughput gap reflects client overhead.** With the same `NATS.Client.Core` on both sides, CosmoBroker is +11.6% faster in raw message rate. The larger gap seen with `CosmoBroker.Client` (+35%) reflects the native client's own optimizations (direct `PipeWriter` writes, allocation-free span matching).
-- **`CosmoBroker.Client` is ~1.8× faster** than `NATS.Client.Core` against the same CosmoBroker server (1,150k vs 647k msg/sec), making it the best choice for .NET applications.
+CosmoBroker now exposes a native AMQP port in addition to its NATS listener. That means you can point standard RabbitMQ client libraries at CosmoBroker and run common queue workflows without using a custom adapter.
 
----
+For a deeper guide focused on AMQP setup, compatibility, authentication, and benchmarking, see [docs/rabbitmq.md](/Users/kutty/dev/CosmoBroker/docs/rabbitmq.md).
 
-## ⚖️ Feature Parity: CosmoBroker vs. NATS Server
+Currently covered in the native AMQP path:
 
-| Feature Area | CosmoBroker | NATS Server | Notes |
-| :--- | :--- | :--- | :--- |
-| **Core Messaging** | | | |
-| Pub/Sub & Request/Reply | ✅ Supported | ✅ Supported | |
-| Queue Groups | ✅ Supported | ✅ Supported | |
-| **JetStream (Persistence)** | | | |
-| Streams & Consumers | ✅ Supported | ✅ Supported | CosmoBroker uses SQLite/SQL for persistence. |
-| Mirroring / Sourcing | ✅ Supported | ✅ Supported | Data replication for HA and aggregation. |
-| **Authentication** | | | |
-| Token / Simple / TLS | ✅ Supported | ✅ Supported | |
-| JWT / Accounts | ✅ Supported | ✅ Supported | |
-| SQL-backed Auth | ✅ Supported | ❌ (Indirect) | CosmoBroker has a native `SqlAuthenticator`. |
-| **Topologies** | | | |
-| Clustering (Mesh) | ✅ Supported | ✅ Supported | |
-| Leafnodes | ✅ Supported | ✅ Supported | Edge-to-cloud topology. |
-| Gateways (Supercluster)| ✅ Supported | ✅ Supported | |
-| **Protocols** | | | |
-| NATS Protocol | ✅ Supported | ✅ Supported | |
-| MQTT 3.1.1 | ✅ Supported | ✅ Supported | CosmoBroker acts as an MQTT bridge parser. |
-| WebSockets | ✅ Supported | ✅ Supported | |
+- connection and channel open/close
+- vhost-aware authentication and access checks
+- `exchange.declare`, `exchange.delete`, `exchange.bind`, `exchange.unbind`
+- `queue.declare`, `queue.bind`, `queue.unbind`, `queue.delete`, `queue.purge`
+- `basic.publish`, `basic.consume`, `basic.get`
+- `basic.ack`, `basic.nack`, `basic.reject`, `basic.recover`
+- `basic.qos`, `channel.flow`
+- `confirm.select`
+- `tx.select`, `tx.commit`, `tx.rollback`
+- server-named queues
+- exclusive queues and exclusive consumers
+- mandatory publish returns
+- durable queues and durable messages when a repository is configured
 
----
+Current RabbitMQ gap areas are mostly advanced product features rather than core AMQP correctness:
 
-## 🚀 Features & Code Samples
+- management UI / HTTP API
+- quorum queues
+- streams parity with RabbitMQ streams
+- policies / operator policies
+- clustering and replication parity with RabbitMQ
+- plugin ecosystem parity
 
-CosmoBroker is fully compatible with standard NATS clients. The examples below use the official `NATS.Client.Core` package for C#.
+## Getting Started
 
-### 1. Core Messaging (Pub/Sub, Request/Reply, Queue Groups)
+### Run Standalone
 
-**Publish / Subscribe:**
+This starts the broker with NATS enabled on `4222`, monitoring on `8222`, and AMQP disabled.
+
+```bash
+dotnet run --project CosmoBroker.Server/CosmoBroker.Server.csproj
+```
+
+### Run With Native AMQP Enabled
+
+This enables the native RabbitMQ-compatible listener on `5672`.
+
+```bash
+COSMOBROKER_ENABLE_AMQP=true \
+COSMOBROKER_AMQP_PORT=5672 \
+dotnet run --project CosmoBroker.Server/CosmoBroker.Server.csproj
+```
+
+### Run With Persistence
+
+This enables SQLite-backed persistence for JetStream-style data and durable RabbitMQ-style messages.
+
+```bash
+COSMOBROKER_REPO="Data Source=broker.db" \
+COSMOBROKER_ENABLE_AMQP=true \
+COSMOBROKER_AMQP_PORT=5672 \
+dotnet run --project CosmoBroker.Server/CosmoBroker.Server.csproj
+```
+
+### Protocol Switches
+
+You can turn NATS and AMQP on or off independently:
+
+```bash
+# NATS only
+COSMOBROKER_ENABLE_NATS=true \
+COSMOBROKER_ENABLE_AMQP=false \
+dotnet run --project CosmoBroker.Server/CosmoBroker.Server.csproj
+```
+
+```bash
+# AMQP only
+COSMOBROKER_ENABLE_NATS=false \
+COSMOBROKER_ENABLE_AMQP=true \
+COSMOBROKER_AMQP_PORT=5672 \
+dotnet run --project CosmoBroker.Server/CosmoBroker.Server.csproj
+```
+
+```bash
+# both enabled
+COSMOBROKER_ENABLE_NATS=true \
+COSMOBROKER_ENABLE_AMQP=true \
+COSMOBROKER_AMQP_PORT=5672 \
+dotnet run --project CosmoBroker.Server/CosmoBroker.Server.csproj
+```
+
+If you disable both, the process can still run its background services and monitoring endpoint, but it will not accept NATS or AMQP client traffic.
+
+### Runtime Environment Variables
+
+| Variable | Purpose |
+|---|---|
+| `COSMOBROKER_PORT` | NATS listener port |
+| `COSMOBROKER_MONITOR_PORT` | Monitoring endpoint port |
+| `COSMOBROKER_ENABLE_NATS` | Enable or disable the NATS listener |
+| `COSMOBROKER_ENABLE_AMQP` | Enable or disable the AMQP listener |
+| `COSMOBROKER_AMQP_PORT` | Native AMQP listener port |
+| `COSMOBROKER_REPO` | Repository connection string |
+| `COSMOBROKER_CONFIG` | Optional config file path |
+
+## Example Usage
+
+### NATS Publish / Subscribe
+
+Use either `CosmoBroker.Client` or a standard NATS client. The example below uses `NATS.Client.Core`.
+
 ```csharp
+using NATS.Client.Core;
+
 await using var nats = new NatsConnection();
 await nats.ConnectAsync();
 
-// Subscriber
-var sub = Task.Run(async () => {
-    await foreach (var msg in nats.SubscribeAsync<string>("events.orders.*")) {
-        Console.WriteLine($"Received: {msg.Data} on {msg.Subject}");
+var subTask = Task.Run(async () =>
+{
+    await foreach (var msg in nats.SubscribeAsync<string>("orders.created"))
+    {
+        Console.WriteLine($"received: {msg.Data}");
     }
 });
 
-// Publisher
-await nats.PublishAsync("events.orders.created", "Order #1234");
+await nats.PublishAsync("orders.created", "order-123");
 ```
 
-**Request / Reply:**
+### RabbitMQ.Client Against CosmoBroker
+
+For AMQP, use the standard `RabbitMQ.Client` package against CosmoBroker's AMQP port:
+
 ```csharp
-// Responder
-var responder = Task.Run(async () => {
-    await foreach (var msg in nats.SubscribeAsync<string>("services.time")) {
-        await msg.ReplyAsync(DateTime.UtcNow.ToString());
-    }
-});
+using System.Text;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
 
-// Requester
-var reply = await nats.RequestAsync<string, string>("services.time", "get");
-Console.WriteLine($"Server time is: {reply.Data}");
+var factory = new ConnectionFactory
+{
+    HostName = "127.0.0.1",
+    Port = 5672,
+    UserName = "guest",
+    Password = "guest"
+};
+
+await using var connection = await factory.CreateConnectionAsync();
+await using var channel = await connection.CreateChannelAsync();
+
+await channel.ExchangeDeclareAsync("orders", ExchangeType.Direct, durable: true);
+await channel.QueueDeclareAsync("orders.q", durable: true, exclusive: false, autoDelete: false);
+await channel.QueueBindAsync("orders.q", "orders", "created");
+
+var consumer = new AsyncEventingBasicConsumer(channel);
+consumer.ReceivedAsync += async (_, ea) =>
+{
+    var body = Encoding.UTF8.GetString(ea.Body.ToArray());
+    Console.WriteLine($"received: {body}");
+    await channel.BasicAckAsync(ea.DeliveryTag, multiple: false);
+};
+
+await channel.BasicConsumeAsync("orders.q", autoAck: false, consumer);
+
+var payload = Encoding.UTF8.GetBytes("order-123");
+await channel.BasicPublishAsync("orders", "created", mandatory: true, body: payload);
 ```
 
-**Queue Groups (Load Balancing):**
-Messages sent to `jobs.process` are distributed evenly among members of the `worker-group`.
+### Durable Publish With Publisher Confirms
+
 ```csharp
-await foreach (var msg in nats.SubscribeAsync<string>("jobs.process", queueGroup: "worker-group")) {
-    Console.WriteLine($"Worker A processing: {msg.Data}");
-}
+using System.Text;
+using RabbitMQ.Client;
+
+var factory = new ConnectionFactory
+{
+    HostName = "127.0.0.1",
+    Port = 5672,
+    UserName = "guest",
+    Password = "guest"
+};
+
+await using var connection = await factory.CreateConnectionAsync();
+await using var channel = await connection.CreateChannelAsync();
+
+await channel.QueueDeclareAsync("durable.jobs", durable: true, exclusive: false, autoDelete: false);
+await channel.ConfirmSelectAsync();
+
+var props = new BasicProperties
+{
+    Persistent = true,
+    ContentType = "application/json"
+};
+
+await channel.BasicPublishAsync("", "durable.jobs", false, props, Encoding.UTF8.GetBytes("{\"id\":1}"));
+await channel.WaitForConfirmsOrDieAsync(TimeSpan.FromSeconds(5));
 ```
 
-### 2. JetStream (Persistence, Streams, Mirrors, Sourcing)
+## Persistence
 
-**Creating a Stream & Publishing:**
-```csharp
-var js = new JetStreamService(topicTree, repo);
-js.CreateStream(new StreamConfig {
-    Name = "ORDERS",
-    Subjects = new List<string> { "orders.*" }
-});
+When `COSMOBROKER_REPO` is configured:
 
-// Publish a durable message
-await nats.PublishAsync("orders.new", "Order Data");
-```
+- durable RabbitMQ queues survive restart
+- durable RabbitMQ messages survive restart
+- exchange, queue, and binding metadata are restored on startup
+- JetStream-style stream data is persisted
 
-**Stream Mirroring (1:1 Copy):**
-Mirroring creates an exact, read-only replica of another stream. Perfect for disaster recovery or geographic locality.
-```csharp
-js.CreateStream(new StreamConfig {
-    Name = "ORDERS_MIRROR",
-    Mirror = new StreamSource { Name = "ORDERS" }
-});
-// ORDERS_MIRROR automatically receives all data published to ORDERS.
-```
+SQLite works well for local development and benchmarking. The repository abstraction also supports SQL-backed deployments used elsewhere in the broker.
 
-**Stream Sourcing (Many-to-One Aggregation):**
-Sourcing pulls data from multiple streams into one.
-```csharp
-js.CreateStream(new StreamConfig {
-    Name = "ALL_METRICS",
-    Sources = new List<StreamSource> {
-        new StreamSource { Name = "US_METRICS" },
-        new StreamSource { Name = "EU_METRICS" }
-    }
-});
-```
+## Benchmarks And Comparison
 
-### 3. Topologies (Clustering & Leafnodes)
+CosmoBroker includes benchmark modes for NATS, RabbitMQ-style `$RMQ.*` flows, native AMQP, and side-by-side RabbitMQ comparisons.
 
-CosmoBroker supports linking servers together to form resilient meshes or edge networks.
+For a benchmark-focused write-up with current numbers and reproduction steps, see [docs/performance.md](/Users/kutty/dev/CosmoBroker/docs/performance.md).
 
-**Clustering (Full Mesh):**
-Connect equal servers to share the load.
-```csharp
-var cluster = new ClusterManager(server, topicTree);
-cluster.AddPeer(new IPEndPoint(IPAddress.Parse("10.0.0.2"), 4222));
-await cluster.StartAsync(cts.Token);
-```
+### Compare CosmoBroker vs RabbitMQ
 
-**Leafnodes (Hub and Spoke):**
-Extend a central cluster to edge locations securely.
-```csharp
-var leafnodes = new LeafnodeManager(server, topicTree);
-// Connect this local broker to a remote cloud NATS hub
-leafnodes.AddRemote("nats://cloud-hub.example.com:7422");
-```
-
-### 4. Multi-Protocol Sniffing (MQTT & WebSockets)
-
-CosmoBroker detects the incoming protocol on the *same port*. You can connect a standard MQTT client directly to CosmoBroker.
+If RabbitMQ is running locally on `127.0.0.1:5672`, use:
 
 ```bash
-# Using standard mosquitto_pub to publish to CosmoBroker via MQTT
-mosquitto_pub -h localhost -p 4222 -t "sensors/temp" -m "22.5"
-
-# A NATS client can receive that same message
-nats sub "sensors.temp"
+bash benchmarks/compare_amqp.sh
 ```
 
-### 5. Authentication & Security
+This script:
 
-CosmoBroker supports Simple Auth, JWT/NKEYs, X.509 TLS Certificates, and native SQL Auth.
+- starts a local CosmoBroker instance with native AMQP enabled
+- runs the standard `RabbitMQ.Client` scenario comparison
+- writes the output to [benchmarks/amqp-compare-report.txt](/Users/kutty/dev/CosmoBroker/benchmarks/amqp-compare-report.txt)
 
-**Native SQL Authentication:**
-Manage users directly in your database.
-```csharp
-var auth = new SqlAuthenticator("Data Source=broker.db;");
-var broker = new BrokerServer(port: 4222, authenticator: auth);
-```
+### Run The Comparison Matrix
 
-**Traffic Shaping (Subject Mapping):**
-```csharp
-// Securely sandbox a tenant by forcing their traffic into a prefix
-var mapping = new SubjectMapping { SourcePattern = "api.v1" };
-mapping.Destinations.Add(new MapDestination { Subject = "tenantA.api.v1", Weight = 1.0 });
-account.Mappings.AddMapping(mapping);
-```
+For broader performance coverage:
 
----
-
-## 🛠 Getting Started
-
-### Basic Setup (Standalone)
-
-```csharp
-using CosmoBroker;
-
-// Start the broker with default settings (port 4222, monitor 8222)
-var broker = new BrokerServer(port: 4222);
-await broker.StartAsync();
-
-Console.WriteLine("CosmoBroker is running. Connect with any NATS client!");
-```
-
-### Config File + SQLite JetStream
-Set `COSMOBROKER_CONFIG` to point at a config file and `COSMOBROKER_REPO` to enable SQLite persistence.
-
-Example `broker.conf`:
-```
-port: 4222
-jetstream {
-  batch_size: 256
-  batch_delay_ms: 1
-}
-tls {
-  cert: "server.pfx"
-  password: "password"
-}
-auth {
-  type: "sql"
-}
-```
-
-Run from CLI:
 ```bash
-COSMOBROKER_CONFIG=broker.conf COSMOBROKER_REPO="Data Source=broker.db;" dotnet run --project CosmoBroker.Server -c Release
+dotnet run --project CosmoBroker.Benchmarks/CosmoBroker.Benchmarks.csproj -- \
+  --mode compare-amqp-matrix \
+  --profile quick \
+  --cosmo-url amqp://guest:guest@127.0.0.1:5679/ \
+  --rabbit-url amqp://guest:guest@127.0.0.1:5672/
 ```
 
----
+Available benchmark profiles:
 
-## 🏗 Architecture & Tuning
+| Profile | Purpose | Defaults |
+|---|---|---|
+| `quick` | fast local smoke test | `count=1000`, `latency=5`, `repeats=1`, `warmup-runs=0` |
+| `stable` | slower but more repeatable comparison | `count=10000`, `latency=25`, `repeats=3`, `warmup-runs=1` |
+
+You can still override any individual flag after selecting a profile.
+
+### Current AMQP Comparison Status
+
+The current `RabbitMQ.Client` comparison harness covers:
+
+- basic publish/get
+- mandatory returns
+- passive declare failures
+- queue delete preconditions
+- default exchange restrictions
+- publisher confirms
+- transactions
+- exclusive queues across connections
+- redelivery after channel close
+- wrong-password auth rejection
+
+The latest scripted comparison run completed with `16` scenarios and `0` detected anomalies in the exercised matrix.
+
+## Architecture Notes
+
+Core server pieces:
 
 | Component | Responsibility |
-| :--- | :--- |
-| `BrokerServer` | Orchestrates listeners, clustering, and monitoring. |
-| `BrokerConnection` | High-performance `System.IO.Pipelines` handler with zero-copy protocol sniffing. |
-| `TopicTree` | Lock-free Trie structure for fast, zero-allocation subject matching. |
-| `JetStreamService` | Manages durable streams, mirrors, and consumer state. |
-| `MessageRepository`| Native SQLite/SQL engine for persisting streams. |
+|---|---|
+| `BrokerServer` | Process orchestration, listeners, monitoring, lifecycle |
+| `BrokerConnection` | High-throughput connection handling and protocol sniffing |
+| `ExchangeManager` | RabbitMQ-style exchanges, queues, bindings, routing |
+| `RabbitQueue` | Queue state, delivery tracking, redelivery, consumer flow |
+| `MessageRepository` | SQLite / SQL persistence for streams and durable RMQ state |
 
-### v1.1.2+ Ultra-Performance Architecture
+Hot-path design goals:
 
-**Server hot-path optimizations:**
-- **Zero-allocation message dispatch**: Subjects and subscription metadata flow through `ReadOnlySpan<T>` end-to-end. No heap allocations on the publish/subscribe critical path.
-- **Batch `FlushAsync` coalescing**: A `[ThreadStatic]` batch context groups all subscriber pipe flushes triggered within a single `ProcessPipeAsync` drain cycle into one flush per subscriber, reducing pipe lock acquisitions from O(messages) to O(1) per drain.
-- **SubEntry state carrier**: The `Sublist` stores the `Subscription` object directly in `SubEntry.State`, eliminating a `ConcurrentDictionary` lookup per message delivery on the fast path.
-- **Scatter-gather socket sends**: Multi-segment pipe buffers are sent with a single `socket.Send(IList<ArraySegment<byte>>)` syscall instead of N sequential `await socket.SendAsync` calls.
-- **Inline socket completions**: `DOTNET_SYSTEM_NET_SOCKETS_INLINE_COMPLETIONS=1` is set in the Docker image, running epoll callbacks directly on the I/O thread and eliminating one thread-pool dispatch per received message (~15–30% throughput gain in containers).
-- **Thread pool pre-warming**: `ThreadPool.SetMinThreads(cpus × 8, cpus × 4)` at startup prevents the 500 ms/thread ramp-up latency under connection bursts.
-- **Tiered PGO**: `<TieredPGO>true</TieredPGO>` recompiles hot loops using runtime call-count profiles after ~30 s of operation, yielding 10–20% additional throughput on steady-state workloads.
-- **`SustainedLowLatency` GC mode**: Minimises Gen2 collection frequency, reducing tail latency on hot connections.
+- low-allocation socket and pipe handling
+- serialized queue drain to reduce publisher contention
+- durable persistence support without forcing it on non-durable paths
+- benchmark-driven AMQP parity work against a real RabbitMQ instance
 
-**Correctness fixes (this release):**
-- Sublist entries are now cleaned up on connection close, preventing stale delivery to dead connections.
-- `MaxMsgs` auto-unsubscribe is guarded by `Interlocked.CompareExchange`, preventing double-unsubscription under concurrent delivery.
-- `ReceivedMsgs` incremented atomically via `Interlocked.Increment`.
-- `TryMatchLiteral` returns snapshot copies of internal lists so callers iterate safely outside the read lock.
-- WebSocket and MQTT connections now respect the configured `IAuthenticator` instead of auto-authenticating unconditionally.
-- `EnterLameDuckMode` is idempotent under concurrent callers via `Interlocked.CompareExchange`.
-- JetStream API responses use the scoped reply-to address so account-prefixed subscribers receive replies correctly.
+## Development
 
-**Client SDK (`CosmoBroker.Client`) optimizations:**
-- Direct `PipeWriter` frame construction — no intermediate string or byte-array allocations per publish.
-- Allocation-free wildcard subject matching via span-based token iteration (no `string.Split`).
-- Semaphore fast-path: lock acquired synchronously in the uncontested case, avoiding async state machine allocation.
-- `UNSUB` on unsubscribe uses a bounded 5-second timeout token, preventing indefinite blocking during connection teardown.
+Build the main projects:
+
+```bash
+dotnet build CosmoBroker.Server/CosmoBroker.Server.csproj
+dotnet build CosmoBroker.Benchmarks/CosmoBroker.Benchmarks.csproj
+```
+
+Run the AMQP interop suite:
+
+```bash
+dotnet test CosmoBroker.Client.Tests/CosmoBroker.Client.Tests.csproj --filter FullyQualifiedName~AmqpInteropTests
+```

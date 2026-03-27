@@ -37,6 +37,7 @@ public class SqlAuthenticator : IAuthenticator
 
         var userName = resolvedUser ?? "sql-user";
         var perms = await _repo.GetUserPermissionsAsync(userName);
+        var rabbitPerms = await _repo.GetRabbitPermissionsAsync(userName);
 
         var account = new Account
         {
@@ -49,6 +50,17 @@ public class SqlAuthenticator : IAuthenticator
             account.DenyPublish.AddRange(perms.DenyPublish);
             account.AllowSubscribe.AddRange(perms.AllowSubscribe);
             account.DenySubscribe.AddRange(perms.DenySubscribe);
+        }
+        if (rabbitPerms != null)
+        {
+            account.RabbitPermissionsConfigured = true;
+            account.DefaultRabbitVhost = rabbitPerms.DefaultVhost;
+            account.RabbitAllowedVhosts.AddRange(rabbitPerms.AllowedVhosts);
+            if (account.RabbitAllowedVhosts.Count == 0)
+                account.RabbitAllowedVhosts.Add(rabbitPerms.DefaultVhost);
+            account.RabbitConfigure.AddRange(rabbitPerms.ConfigurePatterns);
+            account.RabbitWrite.AddRange(rabbitPerms.WritePatterns);
+            account.RabbitRead.AddRange(rabbitPerms.ReadPatterns);
         }
 
         var user = new User { Name = userName, AccountName = account.Name };
