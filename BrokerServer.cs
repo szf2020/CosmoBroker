@@ -242,6 +242,24 @@ public class BrokerServer : IAsyncDisposable
         => _rmqExchanges.TryResetSuperStreamConsumerOffset(vhost, exchangeName, consumerTag, offset, out error, out partitionOffsets);
     public bool TryResolveRabbitSuperStreamPartition(string vhost, string exchangeName, string routingKey, string? partitionKey, out string? error, out string? partition)
         => _rmqExchanges.TryResolveSuperStreamPartition(vhost, exchangeName, routingKey, partitionKey, out error, out partition);
+
+    public bool TryUpdateRabbitStreamRetention(
+        string vhost,
+        string queueName,
+        long? maxLengthMessages,
+        long? maxLengthBytes,
+        long? maxAgeMs,
+        out string? error)
+        => _rmqExchanges.TryUpdateStreamRetention(vhost, queueName, maxLengthMessages, maxLengthBytes, maxAgeMs, out error);
+
+    public bool TryUpdateRabbitSuperStreamRetention(
+        string vhost,
+        string exchangeName,
+        long? maxLengthMessages,
+        long? maxLengthBytes,
+        long? maxAgeMs,
+        out string? error)
+        => _rmqExchanges.TryUpdateSuperStreamRetention(vhost, exchangeName, maxLengthMessages, maxLengthBytes, maxAgeMs, out error);
     public object GetRoutez() => new { routes = _cluster.RouteCount };
     public object GetGatewayz() => new { gateways = _cluster.GatewayCount };
     public object GetLeafz() => new { leafnodes = _leafnodes.ConnectionCount };
@@ -362,6 +380,7 @@ public class BrokerServer : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         _cts?.Cancel();
+        await _monitor.StopAsync();
         _listenSocket?.Dispose();
         _amqpListenSocket?.Dispose();
         _streamListenSocket?.Dispose();

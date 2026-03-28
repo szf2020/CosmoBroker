@@ -16,6 +16,7 @@ public class MonitoringService
     private readonly BrokerServer _server;
     private readonly int _port;
     private Socket? _listenSocket;
+    private Task? _acceptTask;
 
     public MonitoringService(BrokerServer server, int port)
     {
@@ -30,7 +31,16 @@ public class MonitoringService
         _listenSocket.Listen(10);
 
         Console.WriteLine($"[Monitoring] HTTP Stats listening on port {_port}...");
-        _ = AcceptLoopAsync(ct);
+        _acceptTask = AcceptLoopAsync(ct);
+    }
+
+    public async Task StopAsync()
+    {
+        try { _listenSocket?.Dispose(); } catch { }
+        if (_acceptTask != null)
+        {
+            try { await _acceptTask; } catch { }
+        }
     }
 
     private async Task AcceptLoopAsync(CancellationToken ct)
@@ -211,6 +221,76 @@ public class MonitoringService
                     responseData = new { ok = false, error = error ?? "Unable to resolve super stream partition." };
                 }
             }
+            else if (string.Equals(method, "POST", StringComparison.OrdinalIgnoreCase) && path == "/rmq/stream/retention")
+            {
+                string vhost = query.TryGetValue("vhost", out var vhostValue) && !string.IsNullOrWhiteSpace(vhostValue)
+                    ? vhostValue
+                    : "/";
+                string queue = query.TryGetValue("queue", out var queueValue) ? queueValue : string.Empty;
+                long? maxLengthMessages = ParseLong(query.TryGetValue("max_length_messages", out var maxLengthValue) ? maxLengthValue : null);
+                long? maxLengthBytes = ParseLong(query.TryGetValue("max_length_bytes", out var maxBytesValue) ? maxBytesValue : null);
+                long? maxAgeMs = ParseLong(query.TryGetValue("max_age_ms", out var maxAgeValue) ? maxAgeValue : null);
+
+                if (string.IsNullOrWhiteSpace(queue))
+                {
+                    statusCode = 400;
+                    reasonPhrase = "Bad Request";
+                    responseData = new { ok = false, error = "Queue is required." };
+                }
+                else if (_server.TryUpdateRabbitStreamRetention(vhost, queue, maxLengthMessages, maxLengthBytes, maxAgeMs, out var error))
+                {
+                    responseData = new
+                    {
+                        ok = true,
+                        vhost,
+                        queue,
+                        max_length_messages = maxLengthMessages,
+                        max_length_bytes = maxLengthBytes,
+                        max_age_ms = maxAgeMs
+                    };
+                }
+                else
+                {
+                    statusCode = 400;
+                    reasonPhrase = "Bad Request";
+                    responseData = new { ok = false, error = error ?? "Unable to update stream retention." };
+                }
+            }
+            else if (string.Equals(method, "POST", StringComparison.OrdinalIgnoreCase) && path == "/rmq/super-stream/retention")
+            {
+                string vhost = query.TryGetValue("vhost", out var vhostValue) && !string.IsNullOrWhiteSpace(vhostValue)
+                    ? vhostValue
+                    : "/";
+                string exchange = query.TryGetValue("exchange", out var exchangeValue) ? exchangeValue : string.Empty;
+                long? maxLengthMessages = ParseLong(query.TryGetValue("max_length_messages", out var maxLengthValue) ? maxLengthValue : null);
+                long? maxLengthBytes = ParseLong(query.TryGetValue("max_length_bytes", out var maxBytesValue) ? maxBytesValue : null);
+                long? maxAgeMs = ParseLong(query.TryGetValue("max_age_ms", out var maxAgeValue) ? maxAgeValue : null);
+
+                if (string.IsNullOrWhiteSpace(exchange))
+                {
+                    statusCode = 400;
+                    reasonPhrase = "Bad Request";
+                    responseData = new { ok = false, error = "Exchange is required." };
+                }
+                else if (_server.TryUpdateRabbitSuperStreamRetention(vhost, exchange, maxLengthMessages, maxLengthBytes, maxAgeMs, out var error))
+                {
+                    responseData = new
+                    {
+                        ok = true,
+                        vhost,
+                        exchange,
+                        max_length_messages = maxLengthMessages,
+                        max_length_bytes = maxLengthBytes,
+                        max_age_ms = maxAgeMs
+                    };
+                }
+                else
+                {
+                    statusCode = 400;
+                    reasonPhrase = "Bad Request";
+                    responseData = new { ok = false, error = error ?? "Unable to update super stream retention." };
+                }
+            }
             else
             {
                 responseData = new { error = "Not Found", paths = new[] { "/varz", "/connz", "/routez", "/leafz", "/gatewayz", "/jsz", "/rmqz" } };
@@ -266,5 +346,12 @@ public class MonitoringService
             "next" => new RabbitStreamOffsetSpec { Kind = RabbitStreamOffsetKind.Next },
             _ => null
         };
+    }
+
+    private static long? ParseLong(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+        return long.TryParse(value, out var result) ? result : null;
     }
 }
