@@ -105,6 +105,7 @@ public class MessageRepository
         await EnsureRabbitQueueTypeColumnAsync(ct);
         await EnsureRabbitExchangeMetadataColumnsAsync(ct);
         await EnsureRabbitStreamRetentionColumnsAsync(ct);
+        await EnsureRabbitStreamPublisherTableAsync(ct);
     }
 
     private const string SqliteSchema = @"
@@ -184,6 +185,12 @@ public class MessageRepository
                 consumer_tag  TEXT NOT NULL,
                 last_offset   INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (queue_name, consumer_tag)
+            );
+            CREATE TABLE IF NOT EXISTS rmq_stream_publishers (
+                queue_name    TEXT NOT NULL,
+                publisher_ref TEXT NOT NULL,
+                last_sequence INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (queue_name, publisher_ref)
             );
             CREATE TABLE IF NOT EXISTS rmq_messages (
                 id                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -282,6 +289,12 @@ public class MessageRepository
                 consumer_tag  TEXT NOT NULL,
                 last_offset   BIGINT NOT NULL DEFAULT 0,
                 PRIMARY KEY (queue_name, consumer_tag)
+            );
+            CREATE TABLE IF NOT EXISTS rmq_stream_publishers (
+                queue_name    TEXT NOT NULL,
+                publisher_ref TEXT NOT NULL,
+                last_sequence BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (queue_name, publisher_ref)
             );
             CREATE TABLE IF NOT EXISTS rmq_messages (
                 id                    BIGSERIAL PRIMARY KEY,
@@ -390,6 +403,13 @@ public class MessageRepository
                 consumer_tag NVARCHAR(256) NOT NULL,
                 last_offset BIGINT NOT NULL DEFAULT 0,
                 CONSTRAINT PK_rmq_stream_consumers PRIMARY KEY (queue_name, consumer_tag)
+            );
+            IF OBJECT_ID('rmq_stream_publishers', 'U') IS NULL
+            CREATE TABLE rmq_stream_publishers (
+                queue_name NVARCHAR(256) NOT NULL,
+                publisher_ref NVARCHAR(256) NOT NULL,
+                last_sequence BIGINT NOT NULL DEFAULT 0,
+                CONSTRAINT PK_rmq_stream_publishers PRIMARY KEY (queue_name, publisher_ref)
             );
             IF OBJECT_ID('rmq_messages', 'U') IS NULL
             CREATE TABLE rmq_messages (
@@ -641,6 +661,46 @@ public class MessageRepository
         }, ct: ct);
     }
 
+    public async Task<ulong?> GetRabbitStreamPublisherSequenceAsync(string vhost, string queueName, string publisherRef, CancellationToken ct = default)
+    {
+        string scopedQueue = EncodeRabbitScopedName(vhost, queueName);
+        var rows = await _db.QueryAsync(
+            "SELECT last_sequence FROM rmq_stream_publishers WHERE queue_name = @queue AND publisher_ref = @publisher",
+            new[]
+            {
+                SqlParameter.Named("queue", SqlValue.From(scopedQueue)),
+                SqlParameter.Named("publisher", SqlValue.From(publisherRef))
+            },
+            ct: ct);
+
+        if (rows.Count == 0)
+            return null;
+
+        return (ulong)(rows[0]["last_sequence"].AsInt() ?? 0);
+    }
+
+    public async Task UpdateRabbitStreamPublisherSequenceAsync(string vhost, string queueName, string publisherRef, ulong lastSequence, CancellationToken ct = default)
+    {
+        string scopedQueue = EncodeRabbitScopedName(vhost, queueName);
+        var sql = _provider switch
+        {
+            DatabaseProvider.Postgres => "INSERT INTO rmq_stream_publishers (queue_name, publisher_ref, last_sequence) VALUES (@queue, @publisher, @sequence) " +
+                                         "ON CONFLICT(queue_name, publisher_ref) DO UPDATE SET last_sequence = EXCLUDED.last_sequence",
+            DatabaseProvider.MsSql => "IF EXISTS (SELECT 1 FROM rmq_stream_publishers WHERE queue_name = @queue AND publisher_ref = @publisher) " +
+                                      "UPDATE rmq_stream_publishers SET last_sequence = @sequence WHERE queue_name = @queue AND publisher_ref = @publisher " +
+                                      "ELSE INSERT INTO rmq_stream_publishers (queue_name, publisher_ref, last_sequence) VALUES (@queue, @publisher, @sequence)",
+            _ => "INSERT INTO rmq_stream_publishers (queue_name, publisher_ref, last_sequence) VALUES (@queue, @publisher, @sequence) " +
+                 "ON CONFLICT(queue_name, publisher_ref) DO UPDATE SET last_sequence = excluded.last_sequence"
+        };
+
+        await _db.ExecuteAsync(sql, new[]
+        {
+            SqlParameter.Named("queue", SqlValue.From(scopedQueue)),
+            SqlParameter.Named("publisher", SqlValue.From(publisherRef)),
+            SqlParameter.Named("sequence", SqlValue.From((long)lastSequence))
+        }, ct: ct);
+    }
+
     // JetStream Persistence
     public async Task SaveStreamAsync(string name, string subjects, CancellationToken ct = default)
     {
@@ -789,6 +849,18 @@ public class MessageRepository
         await ExecuteIgnoreDuplicateColumnAsync(countSql, ct);
         await ExecuteIgnoreDuplicateColumnAsync(lengthSql, ct);
         await ExecuteIgnoreDuplicateColumnAsync(ageSql, ct);
+    }
+
+    private async Task EnsureRabbitStreamPublisherTableAsync(CancellationToken ct)
+    {
+        var sql = _provider switch
+        {
+            DatabaseProvider.Postgres => "CREATE TABLE IF NOT EXISTS rmq_stream_publishers (queue_name TEXT NOT NULL, publisher_ref TEXT NOT NULL, last_sequence BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (queue_name, publisher_ref))",
+            DatabaseProvider.MsSql => "IF OBJECT_ID('rmq_stream_publishers', 'U') IS NULL CREATE TABLE rmq_stream_publishers (queue_name NVARCHAR(256) NOT NULL, publisher_ref NVARCHAR(256) NOT NULL, last_sequence BIGINT NOT NULL DEFAULT 0, CONSTRAINT PK_rmq_stream_publishers_compat PRIMARY KEY (queue_name, publisher_ref))",
+            _ => "CREATE TABLE IF NOT EXISTS rmq_stream_publishers (queue_name TEXT NOT NULL, publisher_ref TEXT NOT NULL, last_sequence INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (queue_name, publisher_ref))"
+        };
+
+        await _db.ExecuteAsync(sql, ct: ct);
     }
 
     private async Task ExecuteIgnoreDuplicateColumnAsync(string sql, CancellationToken ct)

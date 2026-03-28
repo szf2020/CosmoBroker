@@ -35,9 +35,9 @@ public sealed class RabbitQueue
 
     /// <summary>x-expires — queue TTL in milliseconds (queue auto-deletes when unused).</summary>
     public int? QueueTtlMs { get; init; }
-    public long? StreamMaxLengthBytes { get; init; }
-    public long? StreamMaxLengthMessages { get; init; }
-    public long? StreamMaxAgeMs { get; init; }
+    public long? StreamMaxLengthBytes { get; set; }
+    public long? StreamMaxLengthMessages { get; set; }
+    public long? StreamMaxAgeMs { get; set; }
 
     // --- State ---------------------------------------------------------------
 
@@ -910,6 +910,45 @@ public sealed class RabbitQueue
             return x.DeliveryTag.CompareTo(y.DeliveryTag);
         }
     }
+
+    public void UpdateStreamRetention(long? maxLengthMessages, long? maxLengthBytes, long? maxAgeMs)
+    {
+        StreamMaxLengthMessages = maxLengthMessages;
+        StreamMaxLengthBytes = maxLengthBytes;
+        StreamMaxAgeMs = maxAgeMs;
+
+        if (Type != RabbitQueueType.Stream)
+            return;
+
+        List<RabbitMessage>? removed;
+        lock (_dequeueLock)
+        {
+            removed = TrimStreamRetentionLocked();
+        }
+
+        if (removed == null || removed.Count == 0)
+            return;
+
+        foreach (var message in removed)
+            RetentionDropHandler?.Invoke(message);
+    }
+
+    public RabbitQueueArgs ToArgs()
+        => new()
+        {
+            Type = Type,
+            Durable = Durable,
+            Exclusive = Exclusive,
+            AutoDelete = AutoDelete,
+            MaxPriority = MaxPriority,
+            DeadLetterExchange = DeadLetterExchange,
+            DeadLetterRoutingKey = DeadLetterRoutingKey,
+            MessageTtlMs = MessageTtlMs,
+            QueueTtlMs = QueueTtlMs,
+            StreamMaxLengthBytes = StreamMaxLengthBytes,
+            StreamMaxLengthMessages = StreamMaxLengthMessages,
+            StreamMaxAgeMs = StreamMaxAgeMs
+        };
 }
 
 public enum RabbitQueueType
