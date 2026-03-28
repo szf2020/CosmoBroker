@@ -7,6 +7,8 @@ using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.IO;
+using CosmoBroker.Persistence;
 using RabbitMQ.Client;
 using Xunit;
 using StreamClient = global::RabbitMQ.Stream.Client.Client;
@@ -108,6 +110,127 @@ public sealed class OfficialStreamClientInteropTests : IAsyncDisposable
         finally
         {
             await client.Close("test-complete");
+        }
+    }
+
+    [Fact]
+    public async Task OfficialStreamClient_ShouldRestoreStreamMessagesAndOffsetsAfterRestart()
+    {
+        var streamName = $"official.client.persist.stream.{Guid.NewGuid():N}";
+        var dbPath = Path.Combine(Path.GetTempPath(), $"cosmobroker-stream-{Guid.NewGuid():N}.db");
+        var connectionString = $"Data Source={dbPath};";
+        var streamPort1 = GetFreePort();
+        var amqpPort1 = GetFreePort();
+        var monitorPort1 = GetFreePort();
+        var streamPort2 = GetFreePort();
+        var amqpPort2 = GetFreePort();
+        var monitorPort2 = GetFreePort();
+
+        try
+        {
+            var repo1 = new MessageRepository(connectionString);
+            await using (var server1 = new BrokerServer(port: 0, amqpPort: amqpPort1, streamPort: streamPort1, monitorPort: monitorPort1, repo: repo1))
+            {
+                using var cts = new CancellationTokenSource();
+                await server1.StartAsync(cts.Token);
+                WaitForPort("127.0.0.1", streamPort1, TimeSpan.FromSeconds(5));
+
+                var client = await StreamClient.Create(new StreamClientParameters
+                {
+                    UserName = "guest",
+                    Password = "guest",
+                    VirtualHost = "/",
+                    Endpoint = new IPEndPoint(IPAddress.Loopback, streamPort1)
+                });
+
+                try
+                {
+                    var create = await client.CreateStream(streamName, new Dictionary<string, string>());
+                    Assert.Equal("Ok", ReadProperty<object>(create, "ResponseCode").ToString());
+
+                    var stored = await client.StoreOffset("persist-consumer", streamName, 2);
+                    Assert.True(stored);
+
+                    const string publisherRef = "persist-publisher";
+                    var (publisherId, declare) = await client.DeclarePublisher(
+                        publisherRef: publisherRef,
+                        stream: streamName,
+                        confirmCallback: _ => { },
+                        errorCallback: _ => { });
+                    Assert.Equal("Ok", ReadProperty<object>(declare, "ResponseCode").ToString());
+
+                    var sent = await client.Publish(new StreamPublish(
+                        publisherId,
+                        new List<(ulong, StreamMessage)>
+                        {
+                            (1UL, new StreamMessage(Encoding.UTF8.GetBytes("persisted-stream-message")))
+                        }));
+                    Assert.True(sent);
+
+                    var sequence = await client.QueryPublisherSequence(publisherRef, streamName);
+                    Assert.Equal("Ok", ReadProperty<object>(sequence, "ResponseCode").ToString());
+                    Assert.Equal<ulong>(1, ReadProperty<ulong>(sequence, "Sequence"));
+
+                    await client.DeletePublisher(publisherId);
+                }
+                finally
+                {
+                    await client.Close("persist-phase-1-complete");
+                }
+            }
+
+            var repo2 = new MessageRepository(connectionString);
+            await using (var server2 = new BrokerServer(port: 0, amqpPort: amqpPort2, streamPort: streamPort2, monitorPort: monitorPort2, repo: repo2))
+            {
+                using var cts = new CancellationTokenSource();
+                await server2.StartAsync(cts.Token);
+                WaitForPort("127.0.0.1", streamPort2, TimeSpan.FromSeconds(5));
+
+                var client = await StreamClient.Create(new StreamClientParameters
+                {
+                    UserName = "guest",
+                    Password = "guest",
+                    VirtualHost = "/",
+                    Endpoint = new IPEndPoint(IPAddress.Loopback, streamPort2)
+                });
+
+                try
+                {
+                    var queryOffset = await client.QueryOffset("persist-consumer", streamName);
+                    Assert.Equal("Ok", ReadProperty<object>(queryOffset, "ResponseCode").ToString());
+                    Assert.Equal<ulong>(2, ReadProperty<ulong>(queryOffset, "Offset"));
+
+                    var sequence = await client.QueryPublisherSequence("persist-publisher", streamName);
+                    Assert.Equal("Ok", ReadProperty<object>(sequence, "ResponseCode").ToString());
+                    Assert.Equal<ulong>(1, ReadProperty<ulong>(sequence, "Sequence"));
+
+                    var delivered = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    var (subscriptionId, subscribe) = await client.Subscribe(
+                        streamName,
+                        new StreamOffsetFirst(),
+                        initialCredit: 10,
+                        properties: new Dictionary<string, string>(),
+                        deliverHandler: deliver =>
+                        {
+                            delivered.TrySetResult(DecodeFirstChunkBody(deliver));
+                            return Task.CompletedTask;
+                        });
+
+                    Assert.Equal("Ok", ReadProperty<object>(subscribe, "ResponseCode").ToString());
+                    Assert.Equal("persisted-stream-message", await delivered.Task.WaitAsync(TimeSpan.FromSeconds(10)));
+                    await client.Unsubscribe(subscriptionId);
+                }
+                finally
+                {
+                    await client.Close("persist-phase-2-complete");
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(dbPath); } catch { }
+            try { File.Delete($"{dbPath}-shm"); } catch { }
+            try { File.Delete($"{dbPath}-wal"); } catch { }
         }
     }
 
@@ -630,15 +753,26 @@ public sealed class OfficialStreamClientInteropTests : IAsyncDisposable
 
             Assert.NotEqual(partitionA, partitionB);
 
+            var confirmedIds = new System.Collections.Concurrent.ConcurrentDictionary<ulong, bool>();
+            var allConfirmed = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             var producer = await system.CreateRawSuperStreamProducer(new StreamRawSuperStreamProducerConfig(superStreamName)
             {
                 Reference = "official-super-producer",
-                Routing = message => Encoding.UTF8.GetString(message.Data.Contents.ToArray())
+                Routing = message => Encoding.UTF8.GetString(message.Data.Contents.ToArray()),
+                ConfirmHandler = confirm =>
+                {
+                    var (_, confirmation) = confirm;
+                    if (confirmation.Code == global::RabbitMQ.Stream.Client.ResponseCode.Ok)
+                        confirmedIds.TryAdd(confirmation.PublishingId, true);
+                    if (confirmedIds.ContainsKey(7UL) && confirmedIds.ContainsKey(8UL))
+                        allConfirmed.TrySetResult(true);
+                }
             });
             try
             {
                 await producer.Send(7UL, new StreamMessage(Encoding.UTF8.GetBytes(keyA)));
                 await producer.Send(8UL, new StreamMessage(Encoding.UTF8.GetBytes(keyB)));
+                await allConfirmed.Task.WaitAsync(TimeSpan.FromSeconds(10));
                 Assert.Equal(7UL, await producer.GetLastPublishingId());
             }
             finally
@@ -666,6 +800,157 @@ public sealed class OfficialStreamClientInteropTests : IAsyncDisposable
         finally
         {
             await client.Close("test-complete");
+        }
+    }
+
+    [Fact]
+    public async Task OfficialRawSuperStreamProducer_ShouldRecoverLastPublishingIdAfterRestart()
+    {
+        var superStreamName = $"official.system.super.restart.recovery.{Guid.NewGuid():N}";
+        var dbPath = Path.Combine(Path.GetTempPath(), $"cosmobroker-super-stream-{Guid.NewGuid():N}.db");
+        var connectionString = $"Data Source={dbPath};";
+        var streamPort1 = GetFreePort();
+        var amqpPort1 = GetFreePort();
+        var monitorPort1 = GetFreePort();
+        var streamPort2 = GetFreePort();
+        var amqpPort2 = GetFreePort();
+        var monitorPort2 = GetFreePort();
+
+        try
+        {
+            var repo1 = new MessageRepository(connectionString);
+            await using (var server1 = new BrokerServer(port: 0, amqpPort: amqpPort1, streamPort: streamPort1, monitorPort: monitorPort1, repo: repo1))
+            {
+                using var cts = new CancellationTokenSource();
+                await server1.StartAsync(cts.Token);
+                WaitForPort("127.0.0.1", streamPort1, TimeSpan.FromSeconds(5));
+
+                var client = await StreamClient.Create(new StreamClientParameters
+                {
+                    UserName = "guest",
+                    Password = "guest",
+                    VirtualHost = "/",
+                    Endpoint = new IPEndPoint(IPAddress.Loopback, streamPort1)
+                });
+
+                await using var system = await StreamSystem.Create(new StreamSystemConfig
+                {
+                    UserName = "guest",
+                    Password = "guest",
+                    Endpoints = new List<EndPoint> { new IPEndPoint(IPAddress.Loopback, streamPort1) }
+                });
+
+                try
+                {
+                    var createSuper = await client.CreateSuperStream(
+                        superStreamName,
+                        new List<string> { $"{superStreamName}-0", $"{superStreamName}-1" },
+                        new List<string> { "0", "1" },
+                        new Dictionary<string, string>());
+                    Assert.Equal("Ok", ReadProperty<object>(createSuper, "ResponseCode").ToString());
+
+                    var keyA = "customer-a";
+                    var keyB = "customer-b";
+                    var routeA = await client.QueryRoute(superStreamName, keyA);
+                    var routeB = await client.QueryRoute(superStreamName, keyB);
+                    var partitionA = ReadProperty<IReadOnlyList<string>>(routeA, "Streams")[0];
+                    var partitionB = ReadProperty<IReadOnlyList<string>>(routeB, "Streams")[0];
+                    if (string.Equals(partitionA, partitionB, StringComparison.Ordinal))
+                    {
+                        keyB = "customer-c";
+                        var routeC = await client.QueryRoute(superStreamName, keyB);
+                        partitionB = ReadProperty<IReadOnlyList<string>>(routeC, "Streams")[0];
+                    }
+
+                    Assert.NotEqual(partitionA, partitionB);
+
+                    var confirmedIds2 = new System.Collections.Concurrent.ConcurrentDictionary<ulong, bool>();
+                    var allConfirmed2 = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    var producer = await system.CreateRawSuperStreamProducer(new StreamRawSuperStreamProducerConfig(superStreamName)
+                    {
+                        Reference = "official-super-restart-producer",
+                        Routing = message => Encoding.UTF8.GetString(message.Data.Contents.ToArray()),
+                        ConfirmHandler = confirm =>
+                        {
+                            var (_, confirmation) = confirm;
+                            if (confirmation.Code == global::RabbitMQ.Stream.Client.ResponseCode.Ok)
+                                confirmedIds2.TryAdd(confirmation.PublishingId, true);
+                            if (confirmedIds2.ContainsKey(17UL) && confirmedIds2.ContainsKey(18UL))
+                                allConfirmed2.TrySetResult(true);
+                        }
+                    });
+
+                    try
+                    {
+                        await producer.Send(17UL, new StreamMessage(Encoding.UTF8.GetBytes(keyA)));
+                        await producer.Send(18UL, new StreamMessage(Encoding.UTF8.GetBytes(keyB)));
+                        await allConfirmed2.Task.WaitAsync(TimeSpan.FromSeconds(10));
+                        Assert.Equal(17UL, await producer.GetLastPublishingId());
+                    }
+                    finally
+                    {
+                        await producer.Close();
+                    }
+                }
+                finally
+                {
+                    await client.Close("super-restart-phase-1-complete");
+                }
+            }
+
+            var repo2 = new MessageRepository(connectionString);
+            await using (var server2 = new BrokerServer(port: 0, amqpPort: amqpPort2, streamPort: streamPort2, monitorPort: monitorPort2, repo: repo2))
+            {
+                using var cts = new CancellationTokenSource();
+                await server2.StartAsync(cts.Token);
+                WaitForPort("127.0.0.1", streamPort2, TimeSpan.FromSeconds(5));
+
+                var client = await StreamClient.Create(new StreamClientParameters
+                {
+                    UserName = "guest",
+                    Password = "guest",
+                    VirtualHost = "/",
+                    Endpoint = new IPEndPoint(IPAddress.Loopback, streamPort2)
+                });
+
+                await using var system = await StreamSystem.Create(new StreamSystemConfig
+                {
+                    UserName = "guest",
+                    Password = "guest",
+                    Endpoints = new List<EndPoint> { new IPEndPoint(IPAddress.Loopback, streamPort2) }
+                });
+
+                try
+                {
+                    var producer = await system.CreateRawSuperStreamProducer(new StreamRawSuperStreamProducerConfig(superStreamName)
+                    {
+                        Reference = "official-super-restart-producer",
+                        Routing = message => Encoding.UTF8.GetString(message.Data.Contents.ToArray())
+                    });
+
+                    try
+                    {
+                        Assert.Equal(17UL, await producer.GetLastPublishingId());
+                    }
+                    finally
+                    {
+                        await producer.Close();
+                    }
+
+                    var deleteSuper = await client.DeleteSuperStream(superStreamName);
+                    Assert.Equal("Ok", ReadProperty<object>(deleteSuper, "ResponseCode").ToString());
+                }
+                finally
+                {
+                    await client.Close("super-restart-phase-2-complete");
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(dbPath); } catch { }
+            try { File.Delete($"{dbPath}-shm"); } catch { }
+            try { File.Delete($"{dbPath}-wal"); } catch { }
         }
     }
 
@@ -915,5 +1200,19 @@ public sealed class OfficialStreamClientInteropTests : IAsyncDisposable
         }
 
         throw new TimeoutException($"Timed out waiting for {host}:{port}");
+    }
+
+    private static int GetFreePort()
+    {
+        var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        try
+        {
+            return ((IPEndPoint)listener.LocalEndpoint).Port;
+        }
+        finally
+        {
+            listener.Stop();
+        }
     }
 }

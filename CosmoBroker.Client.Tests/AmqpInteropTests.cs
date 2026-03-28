@@ -2644,9 +2644,9 @@ public class AmqpInteropTests : IAsyncDisposable
     [Fact]
     public async Task AmqpClient_ShouldDeclareSuperStreamAndRouteByPartition()
     {
-        const int port = 5689;
-        const int brokerPort = 4279;
-        const int monitorPort = 8279;
+        int port = GetFreePort();
+        int brokerPort = GetFreePort();
+        int monitorPort = GetFreePort();
 
         await using var server = new BrokerServer(port: brokerPort, amqpPort: port, monitorPort: monitorPort);
         using var cts = new CancellationTokenSource();
@@ -2830,6 +2830,14 @@ public class AmqpInteropTests : IAsyncDisposable
         var lag = queue.GetProperty("stream_consumer_lag");
         Assert.True(lag.TryGetProperty("stream-monitor-consumer", out var consumerLag), rmqz);
         Assert.True(consumerLag.GetInt64() >= 0L, rmqz);
+    }
+
+    private static int GetFreePort()
+    {
+        var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        listener.Start();
+        try { return ((System.Net.IPEndPoint)listener.LocalEndpoint).Port; }
+        finally { listener.Stop(); }
     }
 }
 
@@ -3587,9 +3595,9 @@ public class AmqpPersistenceInteropTests
     {
         string dbPath = Path.Combine(Path.GetTempPath(), $"cosmobroker-amqp-super-stream-{Guid.NewGuid():N}.db");
         string connectionString = $"Data Source={dbPath};";
-        const int brokerPort1 = 4280;
-        const int monitorPort1 = 8280;
-        const int amqpPort1 = 5690;
+        int brokerPort1 = GetFreePort();
+        int monitorPort1 = GetFreePort();
+        int amqpPort1 = GetFreePort();
 
         var repo1 = new MessageRepository(connectionString);
         await using (var server1 = new BrokerServer(port: brokerPort1, amqpPort: amqpPort1, repo: repo1, monitorPort: monitorPort1))
@@ -4093,5 +4101,13 @@ public class AmqpPersistenceInteropTests
 
             return (int)((hash & 0x7fffffff) % partitions);
         }
+    }
+
+    private static int GetFreePort()
+    {
+        var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        listener.Start();
+        try { return ((System.Net.IPEndPoint)listener.LocalEndpoint).Port; }
+        finally { listener.Stop(); }
     }
 }
