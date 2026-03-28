@@ -1,3 +1,4 @@
+/Users/kutty/dev/CosmoBroker/CosmoBroker.Client/CosmoConnection.cs(47,20): warning CS0649: Field 'CosmoConnection.OnDisconnected' is never assigned to, and will always have its default value null [/Users/kutty/dev/CosmoBroker/CosmoBroker.Client/CosmoBroker.Client.csproj]
 AMQP comparison using RabbitMQ.Client
 CosmoBroker: amqp://guest:guest@127.0.0.1:5679/
 RabbitMQ:    amqp://guest:guest@127.0.0.1:5672/
@@ -5,15 +6,23 @@ Messages: 1,000, Payload: 128 bytes, Publishers: 1
 
 --- Running CosmoBroker ---
 CosmoBroker scenarios: 16 complete
+CosmoBroker warmup 1/1
 --- Throughput (1 producer group, 1 consumer) ---
-CosmoBroker throughput: 742,611 msg/sec, dropped 0
-CosmoBroker latency: avg 0.174 ms, p95 0.208 ms
+CosmoBroker throughput: 498,157 msg/sec, dropped 0
+CosmoBroker latency: avg 0.152 ms, p95 0.120 ms
+--- Throughput (1 producer group, 1 consumer) ---
+CosmoBroker throughput: 595,451 msg/sec, dropped 0
+CosmoBroker latency: avg 0.141 ms, p95 0.150 ms
 
 --- Running RabbitMQ ---
 RabbitMQ scenarios: 16 complete
+RabbitMQ warmup 1/1
 --- Throughput (1 producer group, 1 consumer) ---
-RabbitMQ throughput: 663,702 msg/sec, dropped 0
-RabbitMQ latency: avg 0.394 ms, p95 0.313 ms
+RabbitMQ throughput: 850,268 msg/sec, dropped 0
+RabbitMQ latency: avg 0.345 ms, p95 0.259 ms
+--- Throughput (1 producer group, 1 consumer) ---
+RabbitMQ throughput: 1,221,449 msg/sec, dropped 0
+RabbitMQ latency: avg 0.297 ms, p95 0.263 ms
 
 === Scenario Diff ===
 OK basic_publish_get
@@ -23,11 +32,11 @@ OK mandatory_return
   CosmoBroker: code=312 text=NO_ROUTE
   RabbitMQ:    code=312 text=NO_ROUTE
 OK passive_missing_queue
-  CosmoBroker: close code=404 text=NOT_FOUND - no queue 'cmp.missing.8324d80fc2724517a9c6dafd06652b86' in vhost '/'
-  RabbitMQ:    close code=404 text=NOT_FOUND - no queue 'cmp.missing.98b22673941d45c6bd8d7994fd145063' in vhost '/'
+  CosmoBroker: close code=404 text=NOT_FOUND - no queue 'cmp.missing.f8eba836ad724d7f8e65d426f25fc6fb' in vhost '/'
+  RabbitMQ:    close code=404 text=NOT_FOUND - no queue 'cmp.missing.2e62a196e9c849999a64e59c2dc0598c' in vhost '/'
 OK passive_missing_exchange
-  CosmoBroker: close code=404 text=NOT_FOUND - no exchange 'cmp.missing.exchange.addf5481bdf04bf196127d0ffa4b51cb' in vhost '/'
-  RabbitMQ:    close code=404 text=NOT_FOUND - no exchange 'cmp.missing.exchange.ef724596676a46a68e3d89d2c8be8f32' in vhost '/'
+  CosmoBroker: close code=404 text=NOT_FOUND - no exchange 'cmp.missing.exchange.6e9157e7d4dc4d19877b95bf16e9cff0' in vhost '/'
+  RabbitMQ:    close code=404 text=NOT_FOUND - no exchange 'cmp.missing.exchange.870ddc4ad8fc49d8b410a9eafbef6b0a' in vhost '/'
 OK default_exchange_bind_denied
   CosmoBroker: close code=403 text=ACCESS_REFUSED - operation not permitted on the default exchange
   RabbitMQ:    close code=403 text=ACCESS_REFUSED - operation not permitted on the default exchange
@@ -38,8 +47,8 @@ OK tx_commit_without_select
   CosmoBroker: close code=406 text=PRECONDITION_FAILED - channel is not transactional
   RabbitMQ:    close code=406 text=PRECONDITION_FAILED - channel is not transactional
 OK queue_delete_if_unused
-  CosmoBroker: close code=406 text=PRECONDITION_FAILED - queue 'cmp.delete.ifunused.2d48a33b3b7a4630bb5d7631f085df50' in vhost '/' in use
-  RabbitMQ:    close code=406 text=PRECONDITION_FAILED - queue 'cmp.delete.ifunused.27642aa9c99146bd9e4c0ef01bd25962' in vhost '/' in use
+  CosmoBroker: close code=406 text=PRECONDITION_FAILED - queue 'cmp.delete.ifunused.d829ccfe04004129994d6a87d96ef31d' in vhost '/' in use
+  RabbitMQ:    close code=406 text=PRECONDITION_FAILED - queue 'cmp.delete.ifunused.f4071fed9c1a4f4c8d703d501740d344' in vhost '/' in use
 OK default_exchange_unbind_denied
   CosmoBroker: close code=403 text=ACCESS_REFUSED - operation not permitted on the default exchange
   RabbitMQ:    close code=403 text=ACCESS_REFUSED - operation not permitted on the default exchange
@@ -56,8 +65,8 @@ OK tx_rollback_roundtrip
   CosmoBroker: empty
   RabbitMQ:    empty
 OK exclusive_queue_other_connection
-  CosmoBroker: close code=405 text=RESOURCE_LOCKED - cannot obtain exclusive access to locked queue 'amq.gen-2374b553dfe7436b846bc7decb68af3d' in vhost '/'
-  RabbitMQ:    close code=405 text=RESOURCE_LOCKED - cannot obtain exclusive access to locked queue 'amq.gen-lvbbbetQFJ60YPV4i-mP3Q' in vhost '/'. It could be originally declared on another connection or the exclusive property value does not match that of the original declaration.
+  CosmoBroker: close code=405 text=RESOURCE_LOCKED - cannot obtain exclusive access to locked queue 'amq.gen-c05d89dec1164700a5de3f4d0f3db0b6' in vhost '/'
+  RabbitMQ:    close code=405 text=RESOURCE_LOCKED - cannot obtain exclusive access to locked queue 'amq.gen-UIaoBc-73gtvepKc68PidQ' in vhost '/'. It could be originally declared on another connection or the exclusive property value does not match that of the original declaration.
 OK basic_get_redelivery_after_channel_close
   CosmoBroker: redelivered=True body=close-requeue
   RabbitMQ:    redelivered=True body=close-requeue
@@ -66,9 +75,9 @@ OK auth_wrong_password
   RabbitMQ:    exception BrokerUnreachableException: None of the specified endpoints were reachable
 
 === Performance Diff ===
-Throughput: CosmoBroker 742,611 msg/sec vs RabbitMQ 663,702 msg/sec
+Throughput: CosmoBroker 595,451 msg/sec vs RabbitMQ 1,221,449 msg/sec
 Drop rate:  CosmoBroker 0.00% vs RabbitMQ 0.00%
-Latency avg: CosmoBroker 0.174 ms vs RabbitMQ 0.394 ms
-Latency p95: CosmoBroker 0.208 ms vs RabbitMQ 0.313 ms
+Latency avg: CosmoBroker 0.141 ms vs RabbitMQ 0.297 ms
+Latency p95: CosmoBroker 0.150 ms vs RabbitMQ 0.263 ms
 
 Anomalies detected: 0

@@ -11,6 +11,16 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    services:
+      rabbitmq:
+        image: rabbitmq:3-management
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
 
     steps:
     - uses: actions/checkout@v6
@@ -47,3 +57,6 @@ jobs:
     - name: Run RabbitMQ And AMQP Release Tests
       run: |
         dotnet test CosmoBroker.Client.Tests/CosmoBroker.Client.Tests.csproj --no-build -c Release --filter "FullyQualifiedName~AmqpInteropTests|FullyQualifiedName~AmqpAuthInteropTests|FullyQualifiedName~RabbitMQPersistenceTests|FullyQualifiedName~RabbitMQVhostAuthTests" --logger "console;verbosity=normal" --blame-hang-timeout 30s
+
+    - name: Run AMQP comparison benchmark
+      run: bash benchmarks/compare_amqp.sh
