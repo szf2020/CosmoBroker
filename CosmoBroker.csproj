@@ -33,6 +33,9 @@
     <Compile Remove="tools\ManagementSeeder\**" />
     <EmbeddedResource Remove="tools\ManagementSeeder\**" />
     <None Remove="tools\ManagementSeeder\**" />
+    <Compile Remove="tools\JsDecoder\**" />
+    <EmbeddedResource Remove="tools\JsDecoder\**" />
+    <None Remove="tools\JsDecoder\**" />
   </ItemGroup>
 
   <ItemGroup>

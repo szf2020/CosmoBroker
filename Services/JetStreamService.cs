@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -10,7 +11,7 @@ namespace CosmoBroker.Services
 {
     public class JetStreamService
     {
-        private readonly Dictionary<string, JetStreamEntity> _streams = new();
+        private readonly ConcurrentDictionary<string, JetStreamEntity> _streams = new();
         private readonly TopicTree _topicTree;
         private readonly MessageRepository? _repo;
 
