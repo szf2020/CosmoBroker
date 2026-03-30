@@ -7,7 +7,7 @@ surface, and ships production-ready tooling for streaming, retention tuning, and
 | --- | --- |
 | Protocols | NATS JetStream + RabbitMQ Client/Streaming compatibility |
 | Management | HTTP + SSR UI powered by [CosmoApiServer](http://github.com/vkuttyp/CosmoApiServer) |
-| Release | v1.3.1 (NuGet + Docker images via GitHub Actions) |
+| Release | v1.3.10 (NuGet + Docker images via GitHub Actions) |
 
 ## Highlights
 
