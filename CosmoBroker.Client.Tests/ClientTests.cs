@@ -85,6 +85,33 @@ public class ClientTests : IAsyncDisposable
         Assert.Equal("hello echo", reply.GetStringData());
     }
 
+    [Fact]
+    public async Task JetStreamPublish_ShouldReturnAck()
+    {
+        await Task.Delay(100);
+
+        var options = new CosmoClientOptions
+        {
+            Url = "nats://localhost:4233"
+        };
+
+        await using var client = new CosmoClient(options);
+        await client.ConnectAsync();
+
+        var js = new CosmoJetStream(client);
+        await js.EnsureStreamAsync(new StreamConfig
+        {
+            Name = "ACKS",
+            Subjects = ["acks.>"],
+            Storage = "memory"
+        });
+
+        var ack = await js.PublishAsync("acks.test", Encoding.UTF8.GetBytes("hello"));
+        Assert.Equal("ACKS", ack.Stream);
+        Assert.True(ack.Seq > 0);
+        Assert.False(ack.Duplicate);
+    }
+
     public async ValueTask DisposeAsync()
     {
         _cts.Cancel();

@@ -9,6 +9,8 @@ using CosmoBroker.Persistence;
 
 namespace CosmoBroker.Services
 {
+    public sealed record JetStreamPublishResult(string StreamName, long Sequence, bool Duplicate);
+
     public class JetStreamService
     {
         private readonly ConcurrentDictionary<string, JetStreamEntity> _streams = new();
@@ -80,13 +82,14 @@ namespace CosmoBroker.Services
             }
         }
 
-        public async Task Publish(string streamName, string subject, byte[] payload, TimeSpan? ttl = null, string? msgId = null)
+        public async Task<JetStreamPublishResult> Publish(string streamName, string subject, byte[] payload, TimeSpan? ttl = null, string? msgId = null)
         {
             if (!_streams.TryGetValue(streamName, out var stream))
                 throw new Exception($"Stream {streamName} does not exist");
 
             var now = DateTime.UtcNow;
-            if (stream.IsDuplicate(msgId, now)) return;
+            if (stream.IsDuplicate(msgId, now))
+                return new JetStreamPublishResult(streamName, stream.LastSequence, Duplicate: true);
 
             long sequence = 0;
             if (_repo != null)
@@ -109,6 +112,8 @@ namespace CosmoBroker.Services
                     _ = Publish(target.Name, subject, payload, ttl, msgId);
                 }
             }
+
+            return new JetStreamPublishResult(streamName, msg.Sequence, Duplicate: false);
         }
 
         private void BroadcastToConsumers(JetStreamEntity stream, StreamMessage msg)

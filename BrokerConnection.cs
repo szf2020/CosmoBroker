@@ -944,8 +944,48 @@ public class BrokerConnection
 
             if (_jetStream.HasStreams)
             {
-                foreach (var streamName in _jetStream.GetMatchingStreams(scopedSubject))
-                    _ = _jetStream.Publish(streamName, scopedSubject, payload.ToArray(), ttl, msgId);
+                var streamMatches = _jetStream.GetMatchingStreams(scopedSubject).ToArray();
+                if (streamMatches.Length > 0)
+                {
+                    var publishPayload = payload.ToArray();
+
+                    if (!string.IsNullOrEmpty(scopedReplyTo))
+                    {
+                        var capturedReplyTo = scopedReplyTo;
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                Services.JetStreamPublishResult? ack = null;
+                                foreach (var streamName in streamMatches)
+                                {
+                                    var result = await _jetStream.Publish(streamName, scopedSubject, publishPayload, ttl, msgId);
+                                    ack ??= result;
+                                }
+
+                                if (ack != null)
+                                {
+                                    var response = Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(new
+                                    {
+                                        stream = ack.StreamName,
+                                        seq = ack.Sequence,
+                                        duplicate = ack.Duplicate
+                                    }));
+                                    _topicTree.Publish(capturedReplyTo, new ReadOnlySequence<byte>(response), source: this);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.Error.WriteLine($"[JetStream] Publish error: {ex.Message}");
+                            }
+                        });
+                    }
+                    else
+                    {
+                        foreach (var streamName in streamMatches)
+                            _ = _jetStream.Publish(streamName, scopedSubject, publishPayload, ttl, msgId);
+                    }
+                }
             }
         }
         _topicTree.PublishWithTTL(scopedSubject, payload, scopedReplyTo, ttl, this);
