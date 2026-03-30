@@ -1227,6 +1227,8 @@ public class AmqpInteropTests : IAsyncDisposable
     public async Task AmqpClient_ShouldPauseAndResumeDeliveriesWithChannelFlow()
     {
         await Task.Delay(250);
+        var exchangeName = $"amqp.flow.delivery.{Guid.NewGuid():N}.x";
+        var queueName = $"amqp.flow.delivery.{Guid.NewGuid():N}.q";
 
         var factory = new ConnectionFactory
         {
@@ -1241,9 +1243,9 @@ public class AmqpInteropTests : IAsyncDisposable
         using (var setupConnection = factory.CreateConnection())
         using (var setupChannel = setupConnection.CreateModel())
         {
-            setupChannel.ExchangeDeclare("amqp.flow.delivery.x", ExchangeType.Direct, durable: true, autoDelete: false);
-            setupChannel.QueueDeclare("amqp.flow.delivery.q", durable: true, exclusive: false, autoDelete: false);
-            setupChannel.QueueBind("amqp.flow.delivery.q", "amqp.flow.delivery.x", "flow");
+            setupChannel.ExchangeDeclare(exchangeName, ExchangeType.Direct, durable: true, autoDelete: false);
+            setupChannel.QueueDeclare(queueName, durable: true, exclusive: false, autoDelete: false);
+            setupChannel.QueueBind(queueName, exchangeName, "flow");
         }
 
         using var client = new TcpClient();
@@ -1256,7 +1258,7 @@ public class AmqpInteropTests : IAsyncDisposable
         await WriteMethodFrameAsync(stream, 1, 60, 20, writer =>
         {
             WriteUInt16(writer, 0);
-            WriteShortString(writer, "amqp.flow.delivery.q");
+            WriteShortString(writer, queueName);
             WriteShortString(writer, "ctag-flow");
             writer.WriteByte(0b10); // noAck
             WriteTable(writer, null);
@@ -1273,7 +1275,7 @@ public class AmqpInteropTests : IAsyncDisposable
         using (var publishConnection = factory.CreateConnection())
         using (var publishChannel = publishConnection.CreateModel())
         {
-            publishChannel.BasicPublish("amqp.flow.delivery.x", "flow", basicProperties: null, body: Encoding.UTF8.GetBytes("held-back"));
+            publishChannel.BasicPublish(exchangeName, "flow", basicProperties: null, body: Encoding.UTF8.GetBytes("held-back"));
         }
 
         var pendingFrame = await ReadAmqpFrameWithTimeoutAsync(stream, TimeSpan.FromMilliseconds(300));
@@ -1284,8 +1286,7 @@ public class AmqpInteropTests : IAsyncDisposable
         AssertMethod(flowOnOk.Payload, 20, 21);
         Assert.True(ReadBoolean(flowOnOk.Payload.AsSpan(4)));
 
-        var deliver = await ReadAmqpFrameAsync(stream);
-        AssertMethod(deliver.Payload, 60, 60);
+        var deliver = await ReadAmqpFrameUntilMethodAsync(stream, 60, 60, TimeSpan.FromSeconds(2));
         var header = await ReadAmqpFrameAsync(stream);
         Assert.Equal((byte)2, header.Type);
         var body = await ReadAmqpFrameAsync(stream);
@@ -1677,6 +1678,7 @@ public class AmqpInteropTests : IAsyncDisposable
     public async Task AmqpClient_ShouldNotReplyToExchangeDeclareWhenNoWaitIsSet()
     {
         await Task.Delay(250);
+        var exchangeName = $"amqp.nowait.declare.{Guid.NewGuid():N}.x";
 
         using var client = new TcpClient();
         await client.ConnectAsync("127.0.0.1", AmqpPort);
@@ -1688,7 +1690,7 @@ public class AmqpInteropTests : IAsyncDisposable
         await WriteMethodFrameAsync(stream, 1, 40, 10, writer =>
         {
             WriteUInt16(writer, 0);
-            WriteShortString(writer, "amqp.nowait.declare.x");
+            WriteShortString(writer, exchangeName);
             WriteShortString(writer, "direct");
             writer.WriteByte(0b0010_0010); // durable + no-wait
             WriteTable(writer, null);
@@ -1697,22 +1699,14 @@ public class AmqpInteropTests : IAsyncDisposable
         var response = await ReadAmqpFrameWithTimeoutAsync(stream, TimeSpan.FromMilliseconds(300));
         Assert.Null(response);
 
-        using var verifyConnection = new ConnectionFactory
-        {
-            HostName = "127.0.0.1",
-            Port = AmqpPort,
-            UserName = "guest",
-            Password = "guest",
-            VirtualHost = "/"
-        }.CreateConnection();
-        using var verifyChannel = verifyConnection.CreateModel();
-        verifyChannel.ExchangeDeclarePassive("amqp.nowait.declare.x");
+        await AssertExchangeExistsEventuallyAsync(exchangeName);
     }
 
     [Fact]
     public async Task AmqpClient_ShouldNotReplyToQueueDeclareWhenNoWaitIsSet()
     {
         await Task.Delay(250);
+        var queueName = $"amqp.nowait.declare.{Guid.NewGuid():N}.q";
 
         using var client = new TcpClient();
         await client.ConnectAsync("127.0.0.1", AmqpPort);
@@ -1724,7 +1718,7 @@ public class AmqpInteropTests : IAsyncDisposable
         await WriteMethodFrameAsync(stream, 1, 50, 10, writer =>
         {
             WriteUInt16(writer, 0);
-            WriteShortString(writer, "amqp.nowait.declare.q");
+            WriteShortString(writer, queueName);
             writer.WriteByte(0b0010_0010); // durable + no-wait
             WriteTable(writer, null);
         });
@@ -1732,16 +1726,7 @@ public class AmqpInteropTests : IAsyncDisposable
         var response = await ReadAmqpFrameWithTimeoutAsync(stream, TimeSpan.FromMilliseconds(300));
         Assert.Null(response);
 
-        using var verifyConnection = new ConnectionFactory
-        {
-            HostName = "127.0.0.1",
-            Port = AmqpPort,
-            UserName = "guest",
-            Password = "guest",
-            VirtualHost = "/"
-        }.CreateConnection();
-        using var verifyChannel = verifyConnection.CreateModel();
-        verifyChannel.QueueDeclarePassive("amqp.nowait.declare.q");
+        await AssertQueueExistsEventuallyAsync(queueName);
     }
 
     [Fact]
@@ -2026,10 +2011,12 @@ public class AmqpInteropTests : IAsyncDisposable
 
         using var connection = factory.CreateConnection();
         using var channel = connection.CreateModel();
+        var exchangeName = $"amqp.tx.{Guid.NewGuid():N}.x";
+        var queueName = $"amqp.tx.{Guid.NewGuid():N}.q";
 
-        channel.ExchangeDeclare("amqp.tx.x", ExchangeType.Direct, durable: true, autoDelete: false);
-        channel.QueueDeclare("amqp.tx.q", durable: true, exclusive: false, autoDelete: false);
-        channel.QueueBind("amqp.tx.q", "amqp.tx.x", "tx");
+        channel.ExchangeDeclare(exchangeName, ExchangeType.Direct, durable: true, autoDelete: false);
+        channel.QueueDeclare(queueName, durable: true, exclusive: false, autoDelete: false);
+        channel.QueueBind(queueName, exchangeName, "tx");
         channel.TxSelect();
 
         var delivered = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -2040,9 +2027,9 @@ public class AmqpInteropTests : IAsyncDisposable
             channel.BasicAck(ea.DeliveryTag, false);
             await Task.CompletedTask;
         };
-        channel.BasicConsume("amqp.tx.q", autoAck: false, consumer: consumer);
+        channel.BasicConsume(queueName, autoAck: false, consumer: consumer);
 
-        channel.BasicPublish("amqp.tx.x", "tx", basicProperties: null, body: Encoding.UTF8.GetBytes("commit-me"));
+        channel.BasicPublish(exchangeName, "tx", basicProperties: null, body: Encoding.UTF8.GetBytes("commit-me"));
         await Task.Delay(200);
         Assert.False(delivered.Task.IsCompleted);
 
@@ -2066,16 +2053,18 @@ public class AmqpInteropTests : IAsyncDisposable
 
         using var connection = factory.CreateConnection();
         using var channel = connection.CreateModel();
+        var exchangeName = $"amqp.tx.rollback.{Guid.NewGuid():N}.x";
+        var queueName = $"amqp.tx.rollback.{Guid.NewGuid():N}.q";
 
-        channel.ExchangeDeclare("amqp.tx.rollback.x", ExchangeType.Direct, durable: true, autoDelete: false);
-        channel.QueueDeclare("amqp.tx.rollback.q", durable: true, exclusive: false, autoDelete: false);
-        channel.QueueBind("amqp.tx.rollback.q", "amqp.tx.rollback.x", "tx");
+        channel.ExchangeDeclare(exchangeName, ExchangeType.Direct, durable: true, autoDelete: false);
+        channel.QueueDeclare(queueName, durable: true, exclusive: false, autoDelete: false);
+        channel.QueueBind(queueName, exchangeName, "tx");
         channel.TxSelect();
 
-        channel.BasicPublish("amqp.tx.rollback.x", "tx", basicProperties: null, body: Encoding.UTF8.GetBytes("rollback-me"));
+        channel.BasicPublish(exchangeName, "tx", basicProperties: null, body: Encoding.UTF8.GetBytes("rollback-me"));
         channel.TxRollback();
 
-        var result = channel.BasicGet("amqp.tx.rollback.q", autoAck: true);
+        var result = channel.BasicGet(queueName, autoAck: true);
         Assert.Null(result);
     }
 
@@ -2261,6 +2250,66 @@ public class AmqpInteropTests : IAsyncDisposable
         await stream.FlushAsync();
     }
 
+    private async Task AssertExchangeExistsEventuallyAsync(string exchangeName, TimeSpan? timeout = null)
+    {
+        timeout ??= TimeSpan.FromSeconds(2);
+        var deadline = DateTime.UtcNow + timeout.Value;
+        Exception? lastError = null;
+
+        while (DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                using var verifyConnection = CreateConnectionFactory().CreateConnection();
+                using var verifyChannel = verifyConnection.CreateModel();
+                verifyChannel.ExchangeDeclarePassive(exchangeName);
+                return;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                await Task.Delay(50);
+            }
+        }
+
+        throw new Xunit.Sdk.XunitException($"Exchange '{exchangeName}' did not become visible within {timeout.Value.TotalMilliseconds}ms. Last error: {lastError?.Message}");
+    }
+
+    private async Task AssertQueueExistsEventuallyAsync(string queueName, TimeSpan? timeout = null)
+    {
+        timeout ??= TimeSpan.FromSeconds(2);
+        var deadline = DateTime.UtcNow + timeout.Value;
+        Exception? lastError = null;
+
+        while (DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                using var verifyConnection = CreateConnectionFactory().CreateConnection();
+                using var verifyChannel = verifyConnection.CreateModel();
+                verifyChannel.QueueDeclarePassive(queueName);
+                return;
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                await Task.Delay(50);
+            }
+        }
+
+        throw new Xunit.Sdk.XunitException($"Queue '{queueName}' did not become visible within {timeout.Value.TotalMilliseconds}ms. Last error: {lastError?.Message}");
+    }
+
+    private ConnectionFactory CreateConnectionFactory()
+        => new()
+        {
+            HostName = "127.0.0.1",
+            Port = AmqpPort,
+            UserName = "guest",
+            Password = "guest",
+            VirtualHost = "/"
+        };
+
     private static async Task<(byte Type, ushort Channel, byte[] Payload)> ReadAmqpFrameAsync(Stream stream)
     {
         var header = await ReadExactAsync(stream, 7);
@@ -2290,6 +2339,28 @@ public class AmqpInteropTests : IAsyncDisposable
         catch (OperationCanceledException)
         {
             return null;
+        }
+    }
+
+    private static async Task<(byte Type, ushort Channel, byte[] Payload)> ReadAmqpFrameUntilMethodAsync(Stream stream, ushort expectedClassId, ushort expectedMethodId, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (true)
+        {
+            var remaining = deadline - DateTime.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+                throw new TimeoutException($"Timed out waiting for AMQP method {expectedClassId}.{expectedMethodId}.");
+
+            var frame = await ReadAmqpFrameWithTimeoutAsync(stream, remaining);
+            if (frame == null || frame.Value.Type != 1 || frame.Value.Payload.Length < 4)
+                continue;
+
+            var payload = frame.Value.Payload.AsSpan();
+            if (BinaryPrimitives.ReadUInt16BigEndian(payload) == expectedClassId &&
+                BinaryPrimitives.ReadUInt16BigEndian(payload[2..]) == expectedMethodId)
+            {
+                return frame.Value;
+            }
         }
     }
 

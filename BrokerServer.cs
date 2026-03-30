@@ -37,6 +37,7 @@ public class BrokerServer : IAsyncDisposable
     private readonly RabbitMQ.ExchangeManager _rmqExchanges;
     public RabbitMQ.RabbitMQService RabbitMQ { get; }
     private readonly ConcurrentDictionary<BrokerConnection, byte> _connections = new();
+    private readonly ConcurrentDictionary<Task, byte> _connectionTasks = new();
     private readonly X509Certificate2? _serverCertificate;
     private readonly DateTime _startTime = DateTime.UtcNow;
     private long _totalConnections = 0;
@@ -135,7 +136,6 @@ public class BrokerServer : IAsyncDisposable
         if (_port > 0)
         {
             _listenSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            _listenSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
             _listenSocket.ReceiveBufferSize = 8 * 1024 * 1024; // 8MB buffer
             _listenSocket.SendBufferSize = 8 * 1024 * 1024;    // 8MB buffer
             _listenSocket.Bind(new IPEndPoint(IPAddress.Any, _port));
@@ -152,7 +152,6 @@ public class BrokerServer : IAsyncDisposable
         if (_amqpPort > 0)
         {
             _amqpListenSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            _amqpListenSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
             _amqpListenSocket.ReceiveBufferSize = 4 * 1024 * 1024;
             _amqpListenSocket.SendBufferSize = 4 * 1024 * 1024;
             _amqpListenSocket.Bind(new IPEndPoint(IPAddress.Any, _amqpPort));
@@ -168,7 +167,6 @@ public class BrokerServer : IAsyncDisposable
         if (_streamPort > 0)
         {
             _streamListenSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            _streamListenSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
             _streamListenSocket.ReceiveBufferSize = 4 * 1024 * 1024;
             _streamListenSocket.SendBufferSize = 4 * 1024 * 1024;
             _streamListenSocket.Bind(new IPEndPoint(IPAddress.Any, _streamPort));
@@ -279,7 +277,7 @@ public class BrokerServer : IAsyncDisposable
                 socket.SendBufferSize = 8 * 1024 * 1024;
                 Interlocked.Increment(ref _totalConnections);
                 
-                _ = Task.Run(async () => {
+                var connectionTask = Task.Run(async () => {
                     Stream? stream = null;
                     try {
                         stream = new NetworkStream(socket, ownsSocket: true);
@@ -308,6 +306,7 @@ public class BrokerServer : IAsyncDisposable
                     }
                     catch { try { stream?.Dispose(); } catch { } try { socket.Dispose(); } catch { } }
                 }, ct);
+                TrackConnectionTask(connectionTask);
             }
         }
         catch (OperationCanceledException) { }
@@ -326,7 +325,7 @@ public class BrokerServer : IAsyncDisposable
                 socket.SendBufferSize = 4 * 1024 * 1024;
                 Interlocked.Increment(ref _totalConnections);
 
-                _ = Task.Run(async () =>
+                var connectionTask = Task.Run(async () =>
                 {
                     Stream? stream = null;
                     try
@@ -341,6 +340,7 @@ public class BrokerServer : IAsyncDisposable
                         try { socket.Dispose(); } catch { }
                     }
                 }, ct);
+                TrackConnectionTask(connectionTask);
             }
         }
         catch (OperationCanceledException) { }
@@ -359,7 +359,7 @@ public class BrokerServer : IAsyncDisposable
                 socket.SendBufferSize = 4 * 1024 * 1024;
                 Interlocked.Increment(ref _totalConnections);
 
-                _ = Task.Run(async () =>
+                var connectionTask = Task.Run(async () =>
                 {
                     Stream? stream = null;
                     try
@@ -374,10 +374,26 @@ public class BrokerServer : IAsyncDisposable
                         try { socket.Dispose(); } catch { }
                     }
                 }, ct);
+                TrackConnectionTask(connectionTask);
             }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { if (!_lameDuckMode) Console.WriteLine($"[CosmoBroker] Stream accept error: {ex.Message}"); }
+    }
+
+    private void TrackConnectionTask(Task connectionTask)
+    {
+        _connectionTasks[connectionTask] = 0;
+        _ = connectionTask.ContinueWith(
+            static (task, state) =>
+            {
+                var tasks = (ConcurrentDictionary<Task, byte>)state!;
+                tasks.TryRemove(task, out _);
+            },
+            _connectionTasks,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     public async ValueTask DisposeAsync()
@@ -390,5 +406,10 @@ public class BrokerServer : IAsyncDisposable
         if (_acceptTask != null) { try { await _acceptTask; } catch { } }
         if (_amqpAcceptTask != null) { try { await _amqpAcceptTask; } catch { } }
         if (_streamAcceptTask != null) { try { await _streamAcceptTask; } catch { } }
+        var connectionTasks = _connectionTasks.Keys.ToArray();
+        if (connectionTasks.Length > 0)
+        {
+            try { await Task.WhenAll(connectionTasks); } catch { }
+        }
     }
 }
