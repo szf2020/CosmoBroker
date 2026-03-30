@@ -204,6 +204,15 @@ public class BrokerConnection
         Cleanup();
     }
 
+    public void Close()
+    {
+        try { _readerPipe.Reader.CancelPendingRead(); } catch { }
+        try { _readerPipe.Writer.CancelPendingFlush(); } catch { }
+        try { _sendPipe.Reader.CancelPendingRead(); } catch { }
+        try { _sendPipe.Writer.CancelPendingFlush(); } catch { }
+        try { _stream.Close(); } catch { }
+    }
+
     public void ApplyAuth(Auth.AuthResult result)
     {
         if (result.Success)

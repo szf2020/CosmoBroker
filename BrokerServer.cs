@@ -400,6 +400,8 @@ public class BrokerServer : IAsyncDisposable
     {
         _cts?.Cancel();
         await _monitor.StopAsync();
+        foreach (var connection in _connections.Keys)
+            connection.Close();
         _listenSocket?.Dispose();
         _amqpListenSocket?.Dispose();
         _streamListenSocket?.Dispose();
