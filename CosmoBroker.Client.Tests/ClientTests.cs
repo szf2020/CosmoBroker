@@ -112,6 +112,31 @@ public class ClientTests : IAsyncDisposable
         Assert.False(ack.Duplicate);
     }
 
+    [Fact]
+    public async Task IsConnected_ShouldBecomeFalse_AfterServerDisconnect()
+    {
+        await Task.Delay(100);
+
+        var options = new CosmoClientOptions
+        {
+            Url = "nats://localhost:4233"
+        };
+
+        await using var client = new CosmoClient(options);
+        await client.ConnectAsync();
+
+        Assert.True(client.IsConnected);
+
+        _cts.Cancel();
+        await _server.DisposeAsync();
+
+        var deadline = DateTime.UtcNow.AddSeconds(3);
+        while (client.IsConnected && DateTime.UtcNow < deadline)
+            await Task.Delay(50);
+
+        Assert.False(client.IsConnected);
+    }
+
     public async ValueTask DisposeAsync()
     {
         _cts.Cancel();

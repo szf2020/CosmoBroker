@@ -30,6 +30,8 @@ internal class CosmoConnection : IAsyncDisposable
     private readonly CancellationTokenSource _cts = new();
 
     private readonly ConcurrentQueue<TaskCompletionSource> _pings = new();
+    private int _connectedFlag;
+    private int _disconnectHandled;
 
     private static readonly StreamPipeReaderOptions ReaderOptions =
         new(bufferSize: 65_536, minimumReadSize: 8_192);
@@ -42,6 +44,7 @@ internal class CosmoConnection : IAsyncDisposable
         useSynchronizationContext: false);
 
     public ServerInfo? ServerInfo { get; private set; }
+    public bool IsConnected => Volatile.Read(ref _connectedFlag) == 1 && !_cts.IsCancellationRequested;
 
     public Action<CosmoMessage>? OnMessage;
     public Action? OnDisconnected;
@@ -124,6 +127,7 @@ internal class CosmoConnection : IAsyncDisposable
 
         _writeLoopTask = Task.Run(() => WriteLoopAsync(_cts.Token));
         _readLoopTask = Task.Run(() => ReadLoopAsync(_cts.Token));
+        Volatile.Write(ref _connectedFlag, 1);
     }
 
     private async Task SendImmediateAsync(ReadOnlyMemory<byte> data, CancellationToken ct)
@@ -178,8 +182,15 @@ internal class CosmoConnection : IAsyncDisposable
             }
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { Console.Error.WriteLine($"[CONN] WriteLoop: {ex.Message}"); }
-        finally { await reader.CompleteAsync(); }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[CONN] WriteLoop: {ex.Message}");
+        }
+        finally
+        {
+            HandleDisconnect();
+            await reader.CompleteAsync();
+        }
     }
 
     private async Task ReadLoopAsync(CancellationToken ct)
@@ -201,8 +212,15 @@ internal class CosmoConnection : IAsyncDisposable
             }
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) { Console.Error.WriteLine($"[CONN] ReadLoop: {ex.Message}"); }
-        finally { OnDisconnected?.Invoke(); }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[CONN] ReadLoop: {ex.Message}");
+        }
+        finally
+        {
+            HandleDisconnect();
+            OnDisconnected?.Invoke();
+        }
     }
 
     public async Task PingAsync(CancellationToken ct = default)
@@ -398,7 +416,7 @@ internal class CosmoConnection : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        _cts.Cancel();
+        HandleDisconnect();
         _sendPipe.Writer.Complete();
         if (_readLoopTask != null) await _readLoopTask;
         if (_writeLoopTask != null) await _writeLoopTask;
@@ -407,5 +425,23 @@ internal class CosmoConnection : IAsyncDisposable
         _socket?.Dispose();
         _writeLock.Dispose();
         _cts.Dispose();
+    }
+
+    private void HandleDisconnect()
+    {
+        if (Interlocked.Exchange(ref _disconnectHandled, 1) != 0)
+            return;
+
+        Volatile.Write(ref _connectedFlag, 0);
+
+        try { _cts.Cancel(); } catch { }
+        try { _reader?.CancelPendingRead(); } catch { }
+        try { _sendPipe.Reader.CancelPendingRead(); } catch { }
+        try { _sendPipe.Writer.CancelPendingFlush(); } catch { }
+        try { _netStream?.Close(); } catch { }
+        try { _socket?.Dispose(); } catch { }
+
+        while (_pings.TryDequeue(out var pendingPing))
+            pendingPing.TrySetException(new IOException("Connection closed."));
     }
 }

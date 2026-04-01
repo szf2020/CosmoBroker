@@ -25,7 +25,7 @@ public class CosmoClient : IAsyncDisposable
     private readonly ConcurrentDictionary<string, TaskCompletionSource<CosmoMessage>> _requests =
         new(StringComparer.OrdinalIgnoreCase);
 
-    public bool IsConnected => _connection.ServerInfo != null;
+    public bool IsConnected => _connection.IsConnected;
 
     public CosmoClient(CosmoClientOptions? options = null)
     {
