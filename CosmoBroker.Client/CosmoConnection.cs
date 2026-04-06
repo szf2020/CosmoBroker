@@ -32,6 +32,7 @@ internal class CosmoConnection : IAsyncDisposable
     private readonly ConcurrentQueue<TaskCompletionSource> _pings = new();
     private int _connectedFlag;
     private int _disconnectHandled;
+    private int _disposeStarted;
 
     private static readonly StreamPipeReaderOptions ReaderOptions =
         new(bufferSize: 65_536, minimumReadSize: 8_192);
@@ -280,33 +281,54 @@ internal class CosmoConnection : IAsyncDisposable
     /// </summary>
     public ValueTask SendCommandAsync(string command, CancellationToken ct = default)
     {
-        if (!_writeLock.Wait(0))
-            return SendCommandAsyncSlow(command, ct);
+        ThrowIfConnectionClosed(ct);
 
         try
         {
+            if (!_writeLock.Wait(0))
+                return SendCommandAsyncSlow(command, ct);
+        }
+        catch (ObjectDisposedException ex)
+        {
+            throw CreateConnectionClosedException(ex, ct);
+        }
+
+        try
+        {
+            ThrowIfConnectionClosed(ct);
             WriteCommandFrame(_sendPipe.Writer, command);
             var flush = EnqueueFlush(ct);
-            _writeLock.Release();
+            ReleaseWriteLock();
             return flush;
         }
         catch
         {
-            _writeLock.Release();
+            ReleaseWriteLock();
             throw;
         }
     }
 
     private async ValueTask SendCommandAsyncSlow(string command, CancellationToken ct)
     {
-        await _writeLock.WaitAsync(ct);
+        ThrowIfConnectionClosed(ct);
+
         try
         {
+            await _writeLock.WaitAsync(ct);
+        }
+        catch (ObjectDisposedException ex)
+        {
+            throw CreateConnectionClosedException(ex, ct);
+        }
+
+        try
+        {
+            ThrowIfConnectionClosed(ct);
             if (_flushTask is { IsCompleted: false }) await _flushTask;
             WriteCommandFrame(_sendPipe.Writer, command);
             await EnqueueFlush(ct);
         }
-        finally { _writeLock.Release(); }
+        finally { ReleaseWriteLock(); }
     }
 
     /// <summary>
@@ -315,33 +337,54 @@ internal class CosmoConnection : IAsyncDisposable
     /// </summary>
     public ValueTask SendMessageAsync(string subject, string? replyTo, ReadOnlyMemory<byte> payload, CancellationToken ct = default)
     {
-        if (!_writeLock.Wait(0))
-            return SendMessageAsyncSlow(subject, replyTo, payload, ct);
+        ThrowIfConnectionClosed(ct);
 
         try
         {
+            if (!_writeLock.Wait(0))
+                return SendMessageAsyncSlow(subject, replyTo, payload, ct);
+        }
+        catch (ObjectDisposedException ex)
+        {
+            throw CreateConnectionClosedException(ex, ct);
+        }
+
+        try
+        {
+            ThrowIfConnectionClosed(ct);
             WritePublishFrame(_sendPipe.Writer, subject, replyTo, payload);
             var flush = EnqueueFlush(ct);
-            _writeLock.Release();
+            ReleaseWriteLock();
             return flush;
         }
         catch
         {
-            _writeLock.Release();
+            ReleaseWriteLock();
             throw;
         }
     }
 
     private async ValueTask SendMessageAsyncSlow(string subject, string? replyTo, ReadOnlyMemory<byte> payload, CancellationToken ct)
     {
-        await _writeLock.WaitAsync(ct);
+        ThrowIfConnectionClosed(ct);
+
         try
         {
+            await _writeLock.WaitAsync(ct);
+        }
+        catch (ObjectDisposedException ex)
+        {
+            throw CreateConnectionClosedException(ex, ct);
+        }
+
+        try
+        {
+            ThrowIfConnectionClosed(ct);
             if (_flushTask is { IsCompleted: false }) await _flushTask;
             WritePublishFrame(_sendPipe.Writer, subject, replyTo, payload);
             await EnqueueFlush(ct);
         }
-        finally { _writeLock.Release(); }
+        finally { ReleaseWriteLock(); }
     }
 
     /// <summary>
@@ -416,6 +459,7 @@ internal class CosmoConnection : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        Interlocked.Exchange(ref _disposeStarted, 1);
         HandleDisconnect();
         _sendPipe.Writer.Complete();
         if (_readLoopTask != null) await _readLoopTask;
@@ -423,8 +467,36 @@ internal class CosmoConnection : IAsyncDisposable
         if (_reader != null) await _reader.CompleteAsync();
         _netStream?.Dispose();
         _socket?.Dispose();
-        _writeLock.Dispose();
         _cts.Dispose();
+    }
+
+    private void ThrowIfConnectionClosed(CancellationToken ct)
+    {
+        if (ct.IsCancellationRequested)
+            ct.ThrowIfCancellationRequested();
+
+        if (Volatile.Read(ref _disposeStarted) == 1 || _cts.IsCancellationRequested || !IsConnected)
+            throw CreateConnectionClosedException(ct: ct);
+    }
+
+    private IOException CreateConnectionClosedException(Exception? inner = null, CancellationToken ct = default)
+    {
+        if (ct.IsCancellationRequested)
+            throw new OperationCanceledException(ct);
+
+        return new IOException("Connection closed.", inner);
+    }
+
+    private void ReleaseWriteLock()
+    {
+        try
+        {
+            _writeLock.Release();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Concurrent teardown won the race; the caller will observe the closed connection elsewhere.
+        }
     }
 
     private void HandleDisconnect()

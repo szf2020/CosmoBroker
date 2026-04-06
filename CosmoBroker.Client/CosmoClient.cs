@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using CosmoBroker.Client.Models;
+using System.IO;
 
 namespace CosmoBroker.Client;
 
@@ -24,6 +25,7 @@ public class CosmoClient : IAsyncDisposable
 
     private readonly ConcurrentDictionary<string, TaskCompletionSource<CosmoMessage>> _requests =
         new(StringComparer.OrdinalIgnoreCase);
+    private int _disconnectNotified;
 
     public bool IsConnected => _connection.IsConnected;
 
@@ -31,6 +33,7 @@ public class CosmoClient : IAsyncDisposable
     {
         _connection = new CosmoConnection(options ?? new CosmoClientOptions());
         _connection.OnMessage = HandleIncomingMessage;
+        _connection.OnDisconnected = HandleDisconnected;
     }
 
     public async Task ConnectAsync(CancellationToken ct = default)
@@ -66,6 +69,31 @@ public class CosmoClient : IAsyncDisposable
             {
                 _wildcardLock.ExitReadLock();
             }
+        }
+    }
+
+    private void HandleDisconnected()
+    {
+        if (Interlocked.Exchange(ref _disconnectNotified, 1) != 0)
+            return;
+
+        var ex = new IOException("Connection closed.");
+
+        foreach (var pending in _requests.Values)
+            pending.TrySetException(ex);
+
+        foreach (var sub in _exactSubscriptions.Values)
+            sub.Writer.TryComplete();
+
+        _wildcardLock.EnterReadLock();
+        try
+        {
+            foreach (var sub in _wildcardSubscriptions)
+                sub.Channel.Writer.TryComplete();
+        }
+        finally
+        {
+            _wildcardLock.ExitReadLock();
         }
     }
 
@@ -173,19 +201,24 @@ public class CosmoClient : IAsyncDisposable
             {
                 _exactSubscriptions.TryRemove(subject, out _);
             }
-            using var unsubCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-            await _connection.SendCommandAsync($"UNSUB {sid}", unsubCts.Token).ConfigureAwait(false);
+            if (_connection.IsConnected)
+            {
+                using var unsubCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                try
+                {
+                    await _connection.SendCommandAsync($"UNSUB {sid}", unsubCts.Token).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException)
+                {
+                }
+            }
         }
     }
 
     public async ValueTask DisposeAsync()
     {
-        foreach (var sub in _exactSubscriptions.Values) sub.Writer.TryComplete();
-        _wildcardLock.EnterReadLock();
-        try { foreach (var sub in _wildcardSubscriptions) sub.Channel.Writer.TryComplete(); }
-        finally { _wildcardLock.ExitReadLock(); }
+        HandleDisconnected();
 
         await _connection.DisposeAsync();
-        _wildcardLock.Dispose();
     }
 }

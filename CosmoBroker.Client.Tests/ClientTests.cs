@@ -65,7 +65,7 @@ public class ClientTests : IAsyncDisposable
             Url = "nats://localhost:4233"
         };
         
-        await using var client = new CosmoClient(options);
+        var client = new CosmoClient(options);
         await client.ConnectAsync();
 
         var responderTask = Task.Run(async () =>
@@ -135,6 +135,45 @@ public class ClientTests : IAsyncDisposable
             await Task.Delay(50);
 
         Assert.False(client.IsConnected);
+    }
+
+    [Fact]
+    public async Task ActiveSubscriptions_ShouldEndCleanly_WhenClientIsDisposed()
+    {
+        await Task.Delay(100);
+
+        var options = new CosmoClientOptions
+        {
+            Url = "nats://localhost:4233"
+        };
+
+        await using var client = new CosmoClient(options);
+        await client.ConnectAsync();
+
+        var branchTask = Task.Run(async () =>
+        {
+            await foreach (var _ in client.SubscribeAsync("zatca.branch.job"))
+            {
+            }
+        });
+        var invoiceTask = Task.Run(async () =>
+        {
+            await foreach (var _ in client.SubscribeAsync("zatca.invoice.job"))
+            {
+            }
+        });
+        var responseTask = Task.Run(async () =>
+        {
+            await foreach (var _ in client.SubscribeAsync("zatca.response"))
+            {
+            }
+        });
+
+        await Task.Delay(100);
+
+        await client.DisposeAsync();
+
+        await Task.WhenAll(branchTask, invoiceTask, responseTask).WaitAsync(TimeSpan.FromSeconds(3));
     }
 
     public async ValueTask DisposeAsync()
